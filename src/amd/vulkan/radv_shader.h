@@ -173,6 +173,14 @@ struct radv_graphics_state_key {
       uint8_t polygon_mode : 2; /* VK_POLYGON_MODE_FILL/LINE_POINT */
    } rs;
 
+   /* VK_NV_viewport_swizzle: lowered into the last VGT stage, so it is part of
+    * the shader key. swizzle_count == 0 means no swizzle (or the identity).
+    */
+   struct {
+      uint8_t swizzle_count;
+      uint8_t swizzles[MAX_VIEWPORTS][4];
+   } vp;
+
    struct {
       bool sample_shading_enable : 1;
       bool max_sample_shading_enable : 1;
@@ -548,7 +556,15 @@ struct radv_compiler_info {
       uint32_t instr_prefetch_distance : 8;
       uint32_t rbplus_allowed : 1;
       uint32_t address_prt_wa_control_bit : 8;
-      uint32_t padding : 15;
+      /* The shader core decodes GFX11 encodings with a GFX10_3 register interface (Xclipse 920). */
+      uint32_t gfx11_isa : 1;
+      /* The SPI sets FLAT_SCRATCH itself from COMPUTE_DISPATCH_SCRATCH_BASE / SPI_GFX_SCRATCH_BASE,
+       * as on GFX11, though the register interface is GFX10_3 (Xclipse 530 and 940). */
+      uint32_t hw_scratch_base : 1;
+      /* GFX11 NGG geometry (TITAN: Xclipse 530 and 940): NGG for every pre-rasterization stage,
+       * streamout included (the GFX11 GS-register scheme), since the legacy path draws nothing. */
+      uint32_t gfx11_ngg : 1;
+      uint32_t padding : 12;
    } hw;
 
    /* Misc values included as part of the cache key */
@@ -560,6 +576,7 @@ struct radv_compiler_info {
       uint32_t nggc_max_ps_params : 4;
       uint32_t no_ngg_gs : 1;
       uint32_t load_grid_size_from_user_sgpr : 1;
+      uint32_t xclipse_taskmesh_emul : 1;
       uint32_t emulate_ngg_gs_query_pipeline_stat : 1;
       uint32_t primitives_generated_query : 1;
       uint32_t mesh_shader_queries : 1;
@@ -590,7 +607,7 @@ struct radv_compiler_info {
       uint32_t gfx10_descriptor_alias_robust : 1;
       uint32_t nir_debug_info : 1;
       uint32_t use_elf : 1;
-      uint32_t padding : 25;
+      uint32_t padding : 24;
 
       int32_t force_aniso;
 

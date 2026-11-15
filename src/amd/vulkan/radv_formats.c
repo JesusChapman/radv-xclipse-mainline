@@ -6,6 +6,11 @@
  */
 
 #include "radv_formats.h"
+#include <stdlib.h>
+#include "util/detect_os.h"
+#if DETECT_OS_ANDROID
+#include <sys/system_properties.h>
+#endif
 #include "tools/radv_debug.h"
 #include "radv_android.h"
 #include "radv_entrypoints.h"
@@ -273,6 +278,172 @@ radv_is_copy_image_indirect_format_supported(const struct radv_physical_device *
    return true;
 }
 
+/* Xclipse: BC7 re-encoded into ASTC 4x4 (a7_encode() in bc_decoder.glsl) instead of BC3: same size
+ * and sampling cost, 39.1 dB against the exact decode on the RE7 corpus where BC3 gives 32.4, for
+ * about twice the BC3 upload time. Off by default; RADV_XCLIPSE_BC7_ASTC=1 or setprop
+ * debug.radv_xclipse_bc7_astc 1 selects it. */
+static bool
+radv_xclipse_bc7_astc(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_XCLIPSE_BC7_ASTC");
+      int r = e && e[0] && e[0] != '0';
+#if DETECT_OS_ANDROID
+      char p[PROP_VALUE_MAX] = {0};
+      if (!(e && e[0]) && __system_property_get("debug.radv_xclipse_bc7_astc", p) > 0 && p[0])
+         r = p[0] != '0';
+#endif
+      v = r;
+   }
+   return v;
+}
+
+/* Xclipse: BC4_UNORM is re-encoded into EAC_R11 (bc_eac_encode()), half a byte per texel sharing
+ * plane 0's memory, instead of the BC3 alpha byte shuffle (three times the memory, sampled at one
+ * byte per texel). RADV_XCLIPSE_BC4_BC3=1 or setprop debug.radv_xclipse_bc4_bc3 1 restores BC3. */
+static bool
+radv_xclipse_bc4_bc3(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_XCLIPSE_BC4_BC3");
+      int r = e && e[0] && e[0] != '0';
+#if DETECT_OS_ANDROID
+      char p[PROP_VALUE_MAX] = {0};
+      if (!(e && e[0]) && __system_property_get("debug.radv_xclipse_bc4_bc3", p) > 0 && p[0])
+         r = p[0] != '0';
+#endif
+      v = r;
+   }
+   return v;
+}
+
+/* Xclipse: BC7_SRGB rides BC7_UNORM's BC3 carrier as BC3_SRGB (one byte per texel, and it can share
+ * plane 0's memory) instead of an exact RGBA8 decode (four bytes per texel plus the original): an
+ * sRGB BC7 texture took five times its size. The transcode works on the stored (gamma) bytes; the
+ * texture unit's BC3_SRGB decode linearises them. RADV_XCLIPSE_BC7SRGB_RGBA8=1 or setprop
+ * debug.radv_xclipse_bc7srgb_rgba8 1 restores the RGBA8 decode. */
+static bool
+radv_xclipse_bc7srgb_rgba8(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_XCLIPSE_BC7SRGB_RGBA8");
+      int r = e && e[0] && e[0] != '0';
+#if DETECT_OS_ANDROID
+      char p[PROP_VALUE_MAX] = {0};
+      if (!(e && e[0]) && __system_property_get("debug.radv_xclipse_bc7srgb_rgba8", p) > 0 && p[0])
+         r = p[0] != '0';
+#endif
+      v = r;
+   }
+   return v;
+}
+
+/* BC4/BC5_SNORM ride EAC_R11/R11G11_SNORM (same block sizes, so they share the image's memory);
+ * RADV_XCLIPSE_BCSNORM_EXACT=1 / setprop debug.radv_xclipse_bcsnorm_exact 1 restores the exact
+ * R8/RG8_SNORM decode. */
+static bool
+radv_xclipse_bcsnorm_exact(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_XCLIPSE_BCSNORM_EXACT");
+      int r = e && e[0] && e[0] != '0';
+#if DETECT_OS_ANDROID
+      char p[PROP_VALUE_MAX] = {0};
+      if (!(e && e[0]) && __system_property_get("debug.radv_xclipse_bcsnorm_exact", p) > 0 && p[0])
+         r = p[0] != '0';
+#endif
+      v = r;
+   }
+   return v;
+}
+
+/* BC6H_UFLOAT rides B10G11R11_UFLOAT (4 bytes per texel) instead of RGBA16F (8):
+ * RADV_XCLIPSE_BC6H_RGBA16F=1 or setprop debug.radv_xclipse_bc6h_rgba16f 1 restores RGBA16F. */
+static bool
+radv_xclipse_bc6h_rgba16f(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      const char *e = getenv("RADV_XCLIPSE_BC6H_RGBA16F");
+      int r = e && e[0] && e[0] != '0';
+#if DETECT_OS_ANDROID
+      char p[PROP_VALUE_MAX] = {0};
+      if (!(e && e[0]) && __system_property_get("debug.radv_xclipse_bc6h_rgba16f", p) > 0 && p[0])
+         r = p[0] != '0';
+#endif
+      v = r;
+   }
+   return v;
+}
+
+/* The format a BC format is decoded or transcoded into, for texture units without a decoder.
+ * VK_FORMAT_UNDEFINED means "not a BC format we emulate".
+ */
+VkFormat
+radv_bc_emulation_format(VkFormat format)
+{
+   switch (format) {
+   /* BC4_UNORM is re-encoded to EAC_R11 like BC4_SNORM below. With the knob above it is transcoded
+    * to BC3 instead (its alpha half is a BC4 block; the view swizzles R <- A, up to 2 LSB error). */
+   case VK_FORMAT_BC4_UNORM_BLOCK:
+      return radv_xclipse_bc4_bc3() ? VK_FORMAT_BC3_UNORM_BLOCK : VK_FORMAT_EAC_R11_UNORM_BLOCK;
+   /* BC5_UNORM is re-encoded to EAC_R11G11 (both 16 bytes, two channels, 3-bit per-texel indices)
+    * and decoded by the texture unit; within 2 LSB for spread <= 32. Same
+    * (r,g,0,1) semantics, no swizzle. */
+   case VK_FORMAT_BC5_UNORM_BLOCK:
+      return VK_FORMAT_EAC_R11G11_UNORM_BLOCK;
+   /* BC7_UNORM is decoded and re-encoded into BC3 (bc_bc3_encode(), 90.5% of texels within 10 LSB on
+    * the RE7 corpus) instead of an RGBA8 plane (64 bytes per block). With radv_xclipse_bc7_astc() it
+    * goes to ASTC 4x4 instead (a7_encode(), 95.6% within 10 LSB, about twice the upload time). ETC2
+    * tops out at the BC3 carrier's level even with the best offline encoder. See bc_decoder.glsl. */
+   case VK_FORMAT_BC7_UNORM_BLOCK:
+      return radv_xclipse_bc7_astc() ? VK_FORMAT_ASTC_4x4_UNORM_BLOCK : VK_FORMAT_BC3_UNORM_BLOCK;
+   /* BC4/BC5_SNORM are re-encoded the same way into EAC_R11/R11G11_SNORM (bc_eac_encode() in
+    * bc_decoder.glsl), or decoded into channel-exact R8/RG8_SNORM planes with the knob above. */
+   case VK_FORMAT_BC4_SNORM_BLOCK:
+      return radv_xclipse_bcsnorm_exact() ? VK_FORMAT_R8_SNORM : VK_FORMAT_EAC_R11_SNORM_BLOCK;
+   case VK_FORMAT_BC5_SNORM_BLOCK:
+      return radv_xclipse_bcsnorm_exact() ? VK_FORMAT_R8G8_SNORM : VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+   case VK_FORMAT_BC7_SRGB_BLOCK:
+      return radv_xclipse_bc7srgb_rgba8() ? VK_FORMAT_R8G8B8A8_SRGB
+             : radv_xclipse_bc7_astc()      ? VK_FORMAT_ASTC_4x4_SRGB_BLOCK
+                                            : VK_FORMAT_BC3_SRGB_BLOCK;
+   /* BC6H_UFLOAT goes to B10G11R11_UFLOAT: the decoded half floats rounded to 6/6/5 mantissa bits
+    * with the same exponent (at most 0.8% / 0.8% / 1.6% relative error per channel), half the size
+    * and bandwidth of RGBA16F, and BC6H has no alpha anyway. E5B9G9R9 was tried and reverted: small
+    * channels quantise to zero under a shared exponent (measured). BC6H_SFLOAT can be negative and
+    * stays on RGBA16F. */
+   case VK_FORMAT_BC6H_UFLOAT_BLOCK:
+      return radv_xclipse_bc6h_rgba16f() ? VK_FORMAT_R16G16B16A16_SFLOAT : VK_FORMAT_B10G11R11_UFLOAT_PACK32;
+   case VK_FORMAT_BC6H_SFLOAT_BLOCK:
+      return VK_FORMAT_R16G16B16A16_SFLOAT;
+   default:
+      return VK_FORMAT_UNDEFINED;
+   }
+}
+
+/* Xclipse 920 samples ASTC LDR with a hardware decoder (see ac_xclipse_astc_img_format). Only the
+ * 28 contiguous LDR formats are native; HDR (ASTC_*_SFLOAT) stays unadvertised. */
+bool
+radv_xclipse_is_native_astc(const struct radv_physical_device *pdev, VkFormat format)
+{
+   return pdev->xclipse_native_astc && format >= VK_FORMAT_ASTC_4x4_UNORM_BLOCK &&
+          format <= VK_FORMAT_ASTC_12x12_SRGB_BLOCK;
+}
+
+/* Same for ETC2/EAC (see ac_xclipse_etc2_img_format): 10 contiguous formats, ETC2_R8G8B8_UNORM ..
+ * EAC_R11G11_SNORM. */
+bool
+radv_xclipse_is_native_etc2(const struct radv_physical_device *pdev, VkFormat format)
+{
+   return pdev->xclipse_native_etc2 && format >= VK_FORMAT_ETC2_R8G8B8_UNORM_BLOCK &&
+          format <= VK_FORMAT_EAC_R11G11_SNORM_BLOCK;
+}
+
 bool
 radv_is_format_emulated(const struct radv_physical_device *pdev, VkFormat format)
 {
@@ -280,6 +451,9 @@ radv_is_format_emulated(const struct radv_physical_device *pdev, VkFormat format
       return true;
 
    if (pdev->emulate_astc && vk_texcompress_astc_emulation_format(format) != VK_FORMAT_UNDEFINED)
+      return true;
+
+   if (pdev->emulate_bc && radv_bc_emulation_format(format) != VK_FORMAT_UNDEFINED)
       return true;
 
    return false;
@@ -302,18 +476,27 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
 
    if ((desc->layout == UTIL_FORMAT_LAYOUT_ETC && !pdev->info.has_etc_support) ||
        desc->layout == UTIL_FORMAT_LAYOUT_ASTC) {
-      if (radv_is_format_emulated(pdev, format)) {
+      /* Native ASTC reports the same features as emulated ASTC and the vendor (0xd401:
+       * SAMPLED|BLIT_SRC|FILTER_LINEAR|TRANSFER_SRC|TRANSFER_DST). */
+      if (radv_is_format_emulated(pdev, format) || radv_xclipse_is_native_astc(pdev, format) ||
+          radv_xclipse_is_native_etc2(pdev, format)) {
          /* required features for compressed formats */
          tiled = VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
                  VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
                  VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
 
-         VkFormat emulation_format = vk_texcompress_etc2_emulation_format(format);
-         if (emulation_format == VK_FORMAT_UNDEFINED)
-            emulation_format = vk_texcompress_astc_emulation_format(format);
+         /* MINMAX only when emulating: the vendor advertises 0xd401 without it for native
+          * compressed formats. */
+         if (!radv_xclipse_is_native_astc(pdev, format) &&
+             !radv_xclipse_is_native_etc2(pdev, format)) {
+            VkFormat emulation_format = vk_texcompress_etc2_emulation_format(format);
+            if (emulation_format == VK_FORMAT_UNDEFINED)
+               emulation_format = vk_texcompress_astc_emulation_format(format);
 
-         if (radv_is_filter_minmax_format_supported(pdev, emulation_format))
-            tiled |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+            if (emulation_format != VK_FORMAT_UNDEFINED &&
+                radv_is_filter_minmax_format_supported(pdev, emulation_format))
+               tiled |= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_MINMAX_BIT;
+         }
       }
 
       if (radv_is_copy_image_indirect_format_supported(pdev, format)) {
@@ -532,6 +715,40 @@ radv_physical_device_get_format_properties(struct radv_physical_device *pdev, Vk
    if (radv_is_copy_image_indirect_format_supported(pdev, format)) {
       tiled |= VK_FORMAT_FEATURE_2_COPY_IMAGE_INDIRECT_DST_BIT_KHR;
       linear |= VK_FORMAT_FEATURE_2_COPY_IMAGE_INDIRECT_DST_BIT_KHR;
+   }
+
+   /* Xclipse samples depth, 16-bit UNORM/SNORM and 32-bit float channels with nearest filtering
+    * even when the sampler asks for linear (probe/gfx/texfx on the 920 and 960: the midpoint of
+    * two texels reads the second texel). The vendor driver advertises no linear filtering for
+    * exactly these 13 formats (probe/gfx/fmtfeat), so neither do we. Found in paulowesll/mesa
+    * 86f8dbcb99. */
+   if (pdev->info.xclipse_model != AC_XCLIPSE_NONE && desc->layout == UTIL_FORMAT_LAYOUT_PLAIN) {
+      bool nearest_only = vk_format_has_depth(format);
+      for (unsigned c = 0; c < desc->nr_channels; c++) {
+         if ((desc->channel[c].size == 16 && desc->channel[c].normalized) ||
+             (desc->channel[c].size == 32 && desc->channel[c].type == UTIL_FORMAT_TYPE_FLOAT))
+            nearest_only = true;
+      }
+      if (nearest_only) {
+         tiled &= ~VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+         linear &= ~VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT;
+      }
+   }
+
+   /* The Xclipse 920 texture unit only decodes BC1-BC3. BC4-BC7 are emulated (decoded into a hidden
+    * plane at upload, radv_meta_bc_decode.c): sampleable, never storage or colour attachments. */
+   if (pdev->info.gfx11_shader_core && radv_bc_emulation_format(format) != VK_FORMAT_UNDEFINED) {
+      if (pdev->emulate_bc) {
+         /* Emulated: sampleable, never a storage or colour-attachment target. */
+         tiled &= VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_BIT | VK_FORMAT_FEATURE_2_SAMPLED_IMAGE_FILTER_LINEAR_BIT |
+                  VK_FORMAT_FEATURE_2_TRANSFER_SRC_BIT | VK_FORMAT_FEATURE_2_TRANSFER_DST_BIT |
+                  VK_FORMAT_FEATURE_2_BLIT_SRC_BIT;
+      } else {
+         /* No hardware decoder and no emulation: sampling returns zeros. */
+         tiled = 0;
+      }
+      linear = 0;
+      buffer = 0;
    }
 
    out_properties->linearTilingFeatures = linear;
@@ -1009,6 +1226,9 @@ radv_get_image_format_properties(struct radv_physical_device *pdev, const VkPhys
         (image_flags & VK_IMAGE_CREATE_2_MULTISAMPLED_RENDER_TO_SINGLE_SAMPLED_BIT_EXT)) &&
        !(image_usage & VK_IMAGE_USAGE_2_FRAGMENT_SHADING_RATE_ATTACHMENT_BIT_KHR)) {
       sampleCounts |= VK_SAMPLE_COUNT_2_BIT | VK_SAMPLE_COUNT_4_BIT | VK_SAMPLE_COUNT_8_BIT;
+      /* Xclipse: 8x resolves garbage; the vendor exposes 1/2/4 only. */
+      if (pdev->info.gfx11_shader_core)
+         sampleCounts &= ~VK_SAMPLE_COUNT_8_BIT;
    }
 
    if (tiling == VK_IMAGE_TILING_LINEAR && vk_format_is_96bit(format)) {

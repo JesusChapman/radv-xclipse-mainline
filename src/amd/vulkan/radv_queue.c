@@ -9,6 +9,7 @@
  */
 
 #include "radv_queue.h"
+#include "radv_cpushare.h"
 #include "tools/radv_debug_hang.h"
 #include "tools/radv_debug_nir.h"
 #include "tools/radv_rmv.h"
@@ -24,6 +25,15 @@
 #include "ac_cmdbuf.h"
 #include "ac_debug.h"
 #include "ac_descriptors.h"
+#include "amdgfxregs.h"
+#include "radv_logcat.h"
+#include "ac_xclipse_ctxinit.h"
+#include "util/os_time.h"
+#include "util/u_xclipse_prof.h"
+
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
 
 enum radeon_ctx_priority
 radv_get_queue_global_priority(const VkDeviceQueueGlobalPriorityCreateInfo *pObj)
@@ -241,7 +251,11 @@ radv_set_ring_buffer(const struct radv_physical_device *pdev, struct radeon_wins
             PIPE_SWIZZLE_Z,
             PIPE_SWIZZLE_W,
          },
-      .swizzle_enable = swizzle_enable,
+      /* Xclipse: the buffer unit takes the GFX11 descriptor layout, but reads swizzle-enable at
+       * GFX10_3's bit 31, which is GFX11 value 2 (the vendor's GSVS ring descriptor has
+       * 0x80000000 there). GFX11 value 1 sets only bit 30, GFX10_3's CACHE_SWIZZLE: the ring was
+       * not swizzled and the GS copy shader read zeros (transform feedback on the 920). */
+      .swizzle_enable = swizzle_enable && pdev->info.gfx11_shader_core ? 2 : swizzle_enable,
       .element_size = element_size,
       .index_stride = index_stride,
       .add_tid = add_tid,
@@ -249,7 +263,49 @@ radv_set_ring_buffer(const struct radv_physical_device *pdev, struct radeon_wins
       .has_desc_resource_level = pdev->info.compiler_info.has_desc_resource_level,
    };
 
-   ac_build_buffer_descriptor(pdev->info.gfx_level, &ac_state, desc);
+   ac_build_buffer_descriptor(pdev->info.desc_gfx_level, &ac_state, desc);
+}
+
+/* Xclipse task/mesh emulation: one draw + payload ring BO for the whole device, because the
+ * command buffer needs its address at record time (the draw ring is the DRAW_INDIRECT buffer).
+ * The first 256 bytes hold the ring descriptor table the task shader reads. */
+struct radeon_winsys_bo *
+radv_xclipse_task_bo(struct radv_device *device)
+{
+   const struct radv_physical_device *pdev = radv_device_physical(device);
+   struct radeon_winsys_bo *bo = p_atomic_read(&device->xclipse_task_bo);
+
+   if (bo)
+      return bo;
+
+   VkResult result = radv_bo_create(device, NULL, pdev->task_info.bo_size_bytes, 256, RADEON_DOMAIN_VRAM,
+                                    RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING,
+                                    RADV_BO_PRIORITY_SCRATCH, 0, true, &bo);
+   if (result != VK_SUCCESS)
+      return NULL;
+
+   uint32_t *map = radv_buffer_map(device->ws, bo);
+   if (!map) {
+      radv_bo_destroy(device, NULL, bo);
+      return NULL;
+   }
+
+   STATIC_ASSERT((RING_TS_PAYLOAD + 1) * 16 <= 256);
+   memset(map, 0, 256);
+   radv_set_ring_buffer(pdev, bo, pdev->task_info.draw_ring_offset,
+                        pdev->task_info.num_entries * AC_TASK_DRAW_ENTRY_BYTES, false, false, false, 0, 0,
+                        &map[RING_TS_DRAW * 4]);
+   radv_set_ring_buffer(pdev, bo, pdev->task_info.payload_ring_offset,
+                        pdev->task_info.num_entries * pdev->task_info.payload_entry_size, false, false, false, 0, 0,
+                        &map[RING_TS_PAYLOAD * 4]);
+   device->ws->buffer_unmap(device->ws, bo, false);
+
+   struct radeon_winsys_bo *prev = p_atomic_cmpxchg(&device->xclipse_task_bo, NULL, bo);
+   if (prev) {
+      radv_bo_destroy(device, NULL, bo);
+      return prev;
+   }
+   return bo;
 }
 
 static void
@@ -334,7 +390,7 @@ radv_fill_shader_rings(struct radv_device *device, uint32_t *desc, struct radeon
    if (ge_rings_bo) {
       assert(pdev->info.gfx_level >= GFX11);
 
-      ac_build_attr_ring_descriptor(pdev->info.gfx_level, pdev->info.compiler_info.has_desc_resource_level,
+      ac_build_attr_ring_descriptor(pdev->info.desc_gfx_level, pdev->info.compiler_info.has_desc_resource_level,
                                     radv_buffer_get_va(ge_rings_bo), pdev->info.total_attribute_pos_prim_ring_size, 0,
                                     &desc[0]);
    }
@@ -472,7 +528,9 @@ radv_emit_graphics_scratch(struct radv_device *device, struct radv_cmd_stream *c
 
    radv_cs_add_buffer(device->ws, cs->b, scratch_bo);
 
-   ac_emit_cp_gfx_scratch(cs->b, pdev->info.gfx_level, va, tmpring_size);
+   /* Xclipse 530/940: the scratch base registers as on GFX11 (see radv_compiler_info::hw). */
+   ac_emit_cp_gfx_scratch(cs->b, device->compiler_info.hw.hw_scratch_base ? GFX11 : pdev->info.gfx_level, va,
+                          tmpring_size);
 }
 
 static void
@@ -507,6 +565,14 @@ radv_emit_compute_scratch(struct radv_device *device, struct radv_cmd_stream *cs
       radeon_emit(scratch_va >> 40);
    } else {
       uint32_t rsrc1 = S_008F04_BASE_ADDRESS_HI(scratch_va >> 32) | S_008F04_SWIZZLE_ENABLE_GFX6(1);
+
+      /* Xclipse 530/940: the hardware initializes FLAT_SCRATCH from this, as on GFX11; the ring
+       * stays in s[0:1] too, where the shader arguments expect it. */
+      if (device->compiler_info.hw.hw_scratch_base) {
+         radeon_set_sh_reg_seq(R_00B840_COMPUTE_DISPATCH_SCRATCH_BASE_LO, 2);
+         radeon_emit(scratch_va >> 8);
+         radeon_emit(scratch_va >> 40);
+      }
 
       radeon_set_sh_reg_seq(R_00B900_COMPUTE_USER_DATA_0, 2);
       radeon_emit(scratch_va);
@@ -582,6 +648,15 @@ radv_emit_graphics_shader_pointers(struct radv_device *device, struct radv_cmd_s
       for (int i = 0; i < ARRAY_SIZE(regs); ++i) {
          radeon_emit_64bit_pointer(regs[i], va);
       }
+
+      /* TITAN (530, 940) loads s[0:1] of the merged HS and GS stages from PGM_LO/HI_HS and
+       * PGM_LO/HI_GS, as GFX11 does, not from USER_DATA_ADDR. Without it the ring table pointer is
+       * garbage and the first tessellated draw hangs the GPU (the LS-HS and the TES both read
+       * their rings through it). Both stages need it. */
+      if (pdev->info.family == CHIP_TITAN) {
+         radeon_emit_64bit_pointer(R_00B420_SPI_SHADER_PGM_LO_HS, va);
+         radeon_emit_64bit_pointer(R_00B220_SPI_SHADER_PGM_LO_GS, va);
+      }
    } else if (pdev->info.gfx_level == GFX9) {
       uint32_t regs[] = {R_00B030_SPI_SHADER_USER_DATA_PS_0, R_00B130_SPI_SHADER_USER_DATA_VS_0,
                          R_00B208_SPI_SHADER_USER_DATA_ADDR_LO_GS, R_00B408_SPI_SHADER_USER_DATA_ADDR_LO_HS};
@@ -626,6 +701,76 @@ radv_emit_ge_rings(struct radv_device *device, struct radv_cmd_stream *cs, struc
    ac_emit_cp_gfx11_ge_rings(cs->b, &pdev->info, va, pdev->gfx12_hiz_wa == RADV_GFX12_HIZ_WA_PARTIAL);
 }
 
+/* Context init for the Xclipse 530, which never gets a clear state: sgpu skips the RLC clear-state
+ * buffer for AMDGPU_FAMILY_MGFX, so PKT3_CLEAR_STATE is a no-op there and 535 context registers
+ * would stay unwritten. The table is the vendor's init programming observed at runtime (not the
+ * GPL kernel clearstate). Emitted first, so everything else overrides it.
+ *   RADV_XCLIPSE_CTXINIT / debug.radv_xclipse_ctxinit:
+ *     0 = off, CLEAR_STATE allowed   1 = on, no CLEAR_STATE (530 default)
+ *     2 = off, still no CLEAR_STATE
+ *   Returns the raw mode, not a bool. */
+static int
+radv_xclipse_ctxinit_mode(const struct radv_physical_device *pdev)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      int want = -1;
+      const char *e = getenv("RADV_XCLIPSE_CTXINIT");
+      if (e && e[0])
+         want = atoi(e);
+#ifdef __ANDROID__
+      if (want < 0) {
+         char v[PROP_VALUE_MAX] = {0};
+         if (__system_property_get("debug.radv_xclipse_ctxinit", v) > 0 && v[0])
+            want = atoi(v);
+      }
+#endif
+      cached = want >= 0 ? want : ac_xclipse_chip_info(&pdev->info)->ctx_init;
+      RADV_LOGI("[XCLIPSE] ctx_init=%d (model=%d, %u regs)", cached,
+                pdev->info.xclipse_model, (unsigned)ARRAY_SIZE(ac_xclipse_ctx_init));
+   }
+   return cached;
+}
+
+static bool
+radv_xclipse_needs_ctx_init(const struct radv_physical_device *pdev)
+{
+   return radv_xclipse_ctxinit_mode(pdev) == 1;
+}
+
+/* Whether a CLEAR_STATE packet may be sent (separate from the context init):
+ *   0  no context init, CLEAR_STATE allowed      (upstream; unstable on the 530)
+ *   1  context init every submit, no CLEAR_STATE (530 default)
+ *   2  no context init, no CLEAR_STATE
+ */
+static bool
+radv_xclipse_allows_clear_state(const struct radv_physical_device *pdev)
+{
+   return !radv_xclipse_ctxinit_mode(pdev);
+}
+
+/* CB/DB GL2 cache policy. Default: STREAM writes + NOA reads (kernel clearstate). The 530 has one
+ * L2 slice (the 920 has four), where no-allocate may behave differently.
+ *   RADV_XCLIPSE_CBGL2 / debug.radv_xclipse_cbgl2 = 1 -> cache CB and DB in GL2 (LRU). */
+static bool
+radv_xclipse_cb_gl2(void)
+{
+   static int cached = -1;
+   if (cached < 0) {
+      const char *e = getenv("RADV_XCLIPSE_CBGL2");
+      cached = (e && e[0]) ? (atoi(e) != 0) : 0;
+#ifdef __ANDROID__
+      if (!e || !e[0]) {
+         char v[PROP_VALUE_MAX] = {0};
+         if (__system_property_get("debug.radv_xclipse_cbgl2", v) > 0 && v[0])
+            cached = atoi(v) != 0;
+      }
+#endif
+      RADV_LOGI("[XCLIPSE] cache_cb_gl2=%d", cached);
+   }
+   return cached == 1;
+}
+
 static void
 radv_emit_compute(struct radv_device *device, struct radv_cmd_stream *cs, bool is_compute_queue)
 {
@@ -644,6 +789,8 @@ radv_emit_compute(struct radv_device *device, struct radv_cmd_stream *cs, bool i
          },
    };
 
+   RADV_LOGI("[QUEUE] Emitting COMPUTE preamble border_color_va=0x%llx is_compute_queue=%d",
+             (unsigned long long)border_color_va, is_compute_queue);
    ac_init_compute_preamble_state(&preamble_state, pm4);
 
    ac_pm4_set_reg(pm4, R_00B810_COMPUTE_START_X, 0);
@@ -691,9 +838,15 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
    struct radv_physical_device *pdev = radv_device_physical(device);
    const uint64_t border_color_va = device->border_color_data.bo ? radv_buffer_get_va(device->border_color_data.bo) : 0;
    bool has_clear_state = pdev->info.has_clear_state;
+
+   /* No CLEAR_STATE with the context init: the RLC clear-state buffer was never built. */
+   if (!radv_xclipse_allows_clear_state(pdev))
+      has_clear_state = false;
    int i;
 
-   struct ac_pm4_state *pm4 = ac_pm4_create_sized(&pdev->info, false, 512, false);
+   /* 512 dwords covers the stock preamble; the context init adds ~535 registers plus headers. */
+   struct ac_pm4_state *pm4 =
+      ac_pm4_create_sized(&pdev->info, false, radv_xclipse_needs_ctx_init(pdev) ? 2048 : 512, false);
    if (!pm4)
       return;
 
@@ -708,11 +861,34 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
       }
    }
 
+   if (radv_xclipse_needs_ctx_init(pdev)) {
+      /* Ascending order: ac_pm4_set_reg coalesces consecutive registers. */
+      for (unsigned ci = 0; ci < ARRAY_SIZE(ac_xclipse_ctx_init); ci++)
+         ac_pm4_set_reg(pm4, ac_xclipse_ctx_init[ci].reg, ac_xclipse_ctx_init[ci].val);
+   }
+
    const struct ac_preamble_state preamble_state = {
       .border_color_va = border_color_va,
+      .gfx10 =
+         {
+            /* Xclipse: the kernel clearstate policy (STREAM writes, NOA reads) unless
+             * RADV_XCLIPSE_CBGL2 asks for LRU. */
+            .cache_cb_gl2 = radv_xclipse_cb_gl2(),
+            .cache_db_gl2 = radv_xclipse_cb_gl2(),
+         },
    };
 
+   RADV_LOGI("[QUEUE] Emitting GRAPHICS preamble border_color_va=0x%llx has_clear_state=%d",
+             (unsigned long long)border_color_va, has_clear_state);
    ac_init_graphics_preamble_state(&preamble_state, pm4);
+
+   /* Xclipse: the binner's batch budget and sub-batch binning / ping-pong bin order as the vendor
+    * programs them; radv_get_binning_state() sets the matching bin size and states. */
+   const struct ac_xclipse_pbb *xpbb = ac_xclipse_pbb(&pdev->info);
+   if (xpbb) {
+      ac_pm4_set_reg(pm4, R_028C48_PA_SC_BINNER_CNTL_1, xpbb->cntl_1);
+      ac_pm4_set_reg(pm4, R_028C54_PA_SC_BINNER_CNTL_2, xpbb->cntl_2);
+   }
 
    if (!has_clear_state) {
       for (i = 0; i < 16; i++) {
@@ -823,6 +999,39 @@ radv_emit_graphics(struct radv_device *device, struct radv_cmd_stream *cs)
       ac_pm4_set_reg(pm4, R_028424_CB_FDCC_CONTROL, S_028424_DISABLE_CONSTANT_ENCODE_SINGLE(1));
    }
 
+   /* Xclipse IFPO guard: the sgpu kernel's inter-frame power-off can wedge the CPU in
+    * __vangogh_lite_ifpo_power_on (busy-wait, no timeout) until the watchdog resets the phone. It
+    * refuses to power off while CP_PERFMON_CNTL bits [7:0] are nonzero, so keep the perfmon block
+    * in STOP_COUNTING. The preamble re-arms it every submit. May distort
+    * VK_KHR_performance_query across submits. */
+   if (pdev->info.gfx11_shader_core) {
+      ac_pm4_set_reg(pm4, R_036020_CP_PERFMON_CNTL,
+                     S_036020_PERFMON_STATE(V_036020_CP_PERFMON_STATE_STOP_COUNTING));
+      RADV_LOGI("[QUEUE] IFPO guard armed (CP_PERFMON_CNTL=STOP_COUNTING blocks inter-frame power off)");
+   }
+
+   /* Xclipse 960: its kernel programs neither the GL2-to-LLC allocation policy per MTYPE nor
+    * GL2C_CTRL5 (the 940's golden list sets both), and the vendor driver restates them at the start
+    * of every submit. Same values as its submits, effective at the first draw. */
+   if (pdev->xclipse_llc) {
+      static const uint32_t mty[18] = {
+         0x124996db, 0x0001369a, 0, 0, /* MTY0, MTY1 */
+         0x1b6db6db, 0x0001b6db, 0x1b6db6db, 0x0001b6db, 0x1b6db6db, 0x0001b6db, /* MTY2..4 */
+         0x1b6db6db, 0x0001b6db, 0x1b6db6db, 0x0001b6db, 0x1b6db6db, 0x0001b6db, /* MTY5..7 */
+         0, 0, /* MTY_RIDX, MTY_WIDX */
+      };
+      static const uint32_t tail[11] = {
+         0x0001ff7f, 0x0001ff7f, 0x0001ffff, 0xffffffff, 0xffffffff, 0xffffffff,
+         0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff, 0xffffffff,
+      };
+      for (unsigned i = 0; i < ARRAY_SIZE(mty); i++)
+         ac_pm4_set_reg(pm4, CIK_UCONFIG_REG_OFFSET + (0x480 + i) * 4, mty[i]);
+      ac_pm4_set_reg(pm4, CIK_UCONFIG_REG_OFFSET + 0x493 * 4, 0x41); /* GL2ACEM_LLC_TEX */
+      for (unsigned i = 0; i < ARRAY_SIZE(tail); i++)
+         ac_pm4_set_reg(pm4, CIK_UCONFIG_REG_OFFSET + (0x494 + i) * 4, tail[i]);
+      ac_pm4_set_reg(pm4, CIK_UCONFIG_REG_OFFSET + 0x4c0 * 4, 0x00080128); /* GL2C_CTRL5 */
+   }
+
    ac_pm4_finalize(pm4);
    ac_pm4_emit_commands(cs->b, pm4);
    ac_pm4_free_state(pm4);
@@ -921,15 +1130,23 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        */
       uint32_t task_rings_bo_flags = RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING;
 
-      result = radv_bo_create(device, NULL, pdev->task_info.bo_size_bytes, 256, RADEON_DOMAIN_VRAM, task_rings_bo_flags,
-                              RADV_BO_PRIORITY_SCRATCH, 0, true, &task_rings_bo);
-      if (result != VK_SUCCESS)
-         goto fail;
-      radv_rmv_log_command_buffer_bo_create(device, task_rings_bo, 0, 0, pdev->task_info.bo_size_bytes);
+      if (pdev->xclipse_taskmesh_emul) {
+         task_rings_bo = radv_xclipse_task_bo(device);
+         if (!task_rings_bo) {
+            result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+            goto fail;
+         }
+      } else {
+         result = radv_bo_create(device, NULL, pdev->task_info.bo_size_bytes, 256, RADEON_DOMAIN_VRAM, task_rings_bo_flags,
+                                 RADV_BO_PRIORITY_SCRATCH, 0, true, &task_rings_bo);
+         if (result != VK_SUCCESS)
+            goto fail;
+         radv_rmv_log_command_buffer_bo_create(device, task_rings_bo, 0, 0, pdev->task_info.bo_size_bytes);
 
-      result = radv_initialise_task_control_buffer(device, task_rings_bo);
-      if (result != VK_SUCCESS)
-         goto fail;
+         result = radv_initialise_task_control_buffer(device, task_rings_bo);
+         if (result != VK_SUCCESS)
+            goto fail;
+      }
    }
 
    if (!queue->ring_info.mesh_scratch_ring && needs->mesh_scratch_ring) {
@@ -946,8 +1163,12 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
 
    if (!queue->ring_info.ge_rings && needs->ge_rings) {
       assert(pdev->info.gfx_level >= GFX11);
+      /* This APU has no VRAM (vram_size = 0), so RADEON_DOMAIN_VRAM fails: ask the winsys which
+       * domain backs memory. */
       result = radv_bo_create(device, NULL, pdev->info.total_attribute_pos_prim_ring_size, 2 * 1024 * 1024 /* 2MiB */,
-                              RADEON_DOMAIN_VRAM, RADEON_FLAG_32BIT | RADEON_FLAG_DISCARDABLE | ring_bo_flags_tmz,
+                              /* Not cs_domain(): has_dedicated_vram is forced true here. */
+                              pdev->info.vram_size_kb ? RADEON_DOMAIN_VRAM : RADEON_DOMAIN_GTT,
+                              RADEON_FLAG_32BIT | RADEON_FLAG_DISCARDABLE | ring_bo_flags_tmz,
                               RADV_BO_PRIORITY_SCRATCH, 0, true, &ge_rings_bo);
       if (result != VK_SUCCESS)
          goto fail;
@@ -1073,13 +1294,16 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
          break;
       }
 
-      if (i < 2 || task_rings_bo) {
+      /* Firmware task rings only; the Xclipse emulation synchronises around each task draw. */
+      const bool fw_task_rings = task_rings_bo && !pdev->xclipse_taskmesh_emul;
+
+      if (i < 2 || fw_task_rings) {
          /* The two initial preambles have a cache flush at the beginning. */
          const enum amd_gfx_level gfx_level = pdev->info.gfx_level;
          enum ac_barrier_flags flush_bits = AC_BARRIER_INV_ICACHE | AC_BARRIER_INV_SMEM | AC_BARRIER_INV_VMEM |
                                             AC_BARRIER_INV_L2 | AC_BARRIER_PIPELINESTAT_START;
 
-         if (i == 0 || task_rings_bo) {
+         if (i == 0 || fw_task_rings) {
             /* The full flush preamble should also wait for previous shader work to finish. */
             flush_bits |= AC_BARRIER_SYNC_CS;
             if (queue->qf == RADV_QUEUE_GENERAL)
@@ -1093,8 +1317,10 @@ radv_update_preamble_cs(struct radv_queue_state *queue, struct radv_device *devi
        * to make sure that we aren't reading stale data from cache
        * and that a previous submission isn't perturbing the BO.
        */
-      if (task_rings_bo)
+      if (fw_task_rings)
          radv_emit_task_rings(device, cs, task_rings_bo, queue->qf == RADV_QUEUE_COMPUTE);
+      else if (task_rings_bo)
+         radv_cs_add_buffer(ws, cs->b, task_rings_bo);
 
       result = radv_finalize_cmd_stream(device, cs);
       if (result != VK_SUCCESS)
@@ -1178,7 +1404,7 @@ fail:
       radv_bo_destroy(device, NULL, tess_rings_bo);
    if (mesh_scratch_ring_bo && mesh_scratch_ring_bo != queue->mesh_scratch_ring_bo)
       radv_bo_destroy(device, NULL, mesh_scratch_ring_bo);
-   if (task_rings_bo && task_rings_bo != queue->task_rings_bo)
+   if (task_rings_bo && task_rings_bo != queue->task_rings_bo && !pdev->xclipse_taskmesh_emul)
       radv_bo_destroy(device, NULL, task_rings_bo);
    if (ge_rings_bo && ge_rings_bo != queue->ge_rings_bo)
       radv_bo_destroy(device, NULL, ge_rings_bo);
@@ -1854,6 +2080,21 @@ radv_report_gpuvm_fault(struct radv_device *device)
    ac_print_gpuvm_fault_status(stderr, pdev->info.gfx_level, fault_info.status);
 }
 
+static VkResult radv_queue_submit_timed(struct vk_queue *vqueue, struct vk_queue_submit *submission);
+
+/* [CPUSHARE] wrapper, so every exit of radv_queue_submit_timed is timed. */
+static VkResult
+radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+{
+   RADV_CPU_T0();
+   const int64_t xprof_t0 = u_xclipse_prof_active() ? os_time_get_nano() : 0;
+   const VkResult r = radv_queue_submit_timed(vqueue, submission);
+   if (xprof_t0)
+      u_xclipse_prof_wait(U_XCLIPSE_WAIT_SUBMIT, os_time_get_nano() - xprof_t0);
+   RADV_CPU_T1(RADV_CPU_SUBMIT);
+   return r;
+}
+
 void
 radv_queue_handle_fault_state(struct radv_queue *queue)
 {
@@ -1903,7 +2144,7 @@ fail:
 }
 
 static VkResult
-radv_queue_submit(struct vk_queue *vqueue, struct vk_queue_submit *submission)
+radv_queue_submit_timed(struct vk_queue *vqueue, struct vk_queue_submit *submission)
 {
    struct radv_queue *queue = (struct radv_queue *)vqueue;
    struct radv_device *device = radv_queue_device(queue);
@@ -2055,7 +2296,7 @@ radv_queue_state_finish(struct radv_queue_state *queue, struct radv_device *devi
       radv_rmv_log_command_buffer_bo_destroy(device, queue->tess_rings_bo);
       radv_bo_destroy(device, NULL, queue->tess_rings_bo);
    }
-   if (queue->task_rings_bo) {
+   if (queue->task_rings_bo && queue->task_rings_bo != device->xclipse_task_bo) {
       radv_rmv_log_command_buffer_bo_destroy(device, queue->task_rings_bo);
       radv_bo_destroy(device, NULL, queue->task_rings_bo);
    }
