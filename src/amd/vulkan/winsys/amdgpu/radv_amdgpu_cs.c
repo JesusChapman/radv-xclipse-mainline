@@ -6,8 +6,10 @@
  */
 
 #include <assert.h>
+#include "ac_xclipse_log.h"
 #include <libsync.h>
 #include <pthread.h>
+#include <sys/system_properties.h>
 #include <stdlib.h>
 #include "drm-uapi/amdgpu_drm.h"
 
@@ -21,8 +23,10 @@
 #include "ac_linux_drm.h"
 #include "radv_amdgpu_bo.h"
 #include "radv_amdgpu_cs.h"
+#include <android/log.h>
 #include "radv_amdgpu_winsys.h"
 #include "radv_radeon_winsys.h"
+#include "vk_xclipse_perf.h"
 #include "sid.h"
 #include "vk_drm_syncobj.h"
 #include "vk_sync.h"
@@ -225,6 +229,53 @@ radv_amdgpu_cs_domain(const struct radeon_winsys *_ws)
    return use_sam ? RADEON_DOMAIN_VRAM : RADEON_DOMAIN_GTT;
 }
 
+/* Take an IB BO of exactly this size from the winsys cache. See ib_cache in radv_amdgpu_winsys.h. */
+static struct radeon_winsys_bo *
+radv_xclipse_ib_cache_get(struct radv_amdgpu_winsys *ws, uint32_t size)
+{
+   struct radeon_winsys_bo *bo = NULL;
+
+   simple_mtx_lock(&ws->ib_cache.lock);
+   for (uint32_t i = 0; i < ws->ib_cache.count; i++) {
+      if (ws->ib_cache.entries[i].size == size) {
+         bo = ws->ib_cache.entries[i].bo;
+         ws->ib_cache.entries[i] = ws->ib_cache.entries[--ws->ib_cache.count];
+         ws->ib_cache.hits++;
+         break;
+      }
+   }
+   if (!bo)
+      ws->ib_cache.misses++;
+   simple_mtx_unlock(&ws->ib_cache.lock);
+   return bo;
+}
+
+/* Park an IB BO for reuse instead of destroying it (saves a GART unbind now and a bind later).
+ * Only from cs_reset/cs_destroy, where the command buffer is not pending. */
+static bool
+radv_xclipse_ib_cache_put(struct radv_amdgpu_winsys *ws, struct radeon_winsys_bo *bo, uint32_t size)
+{
+   bool parked = false;
+
+   simple_mtx_lock(&ws->ib_cache.lock);
+   if (ws->ib_cache.count < ARRAY_SIZE(ws->ib_cache.entries)) {
+      ws->ib_cache.entries[ws->ib_cache.count].bo = bo;
+      ws->ib_cache.entries[ws->ib_cache.count].size = size;
+      ws->ib_cache.count++;
+      ws->ib_cache.returns++;
+      parked = true;
+
+      /* Report occasionally, to compare with [BO_CHURN] events/s. */
+      if (ws->ib_cache.returns == 1 || !(ws->ib_cache.returns & 0x3f))
+         AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_CHURN",
+                             "[IB_CACHE] hits=%u misses=%u parked=%u held=%u",
+                             ws->ib_cache.hits, ws->ib_cache.misses, ws->ib_cache.returns,
+                             ws->ib_cache.count);
+   }
+   simple_mtx_unlock(&ws->ib_cache.lock);
+   return parked;
+}
+
 static VkResult
 radv_amdgpu_cs_bo_create(struct radv_amdgpu_cs *cs, uint32_t ib_size)
 {
@@ -237,7 +288,22 @@ radv_amdgpu_cs_bo_create(struct radv_amdgpu_cs *cs, uint32_t ib_size)
    const enum radeon_bo_flag gtt_wc_flag = domain == RADEON_DOMAIN_GTT ? 0 : RADEON_FLAG_GTT_WC;
    /* Bypass GL2 because command buffers are read only once and it's better for latency. */
    const enum radeon_bo_flag flags = RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING |
-                                     RADEON_FLAG_READ_ONLY | RADEON_FLAG_GL2_BYPASS | gtt_wc_flag;
+                                     RADEON_FLAG_READ_ONLY | RADEON_FLAG_GL2_BYPASS | gtt_wc_flag |
+                                     /* IB space: the highest-frequency internal churn, safe to
+                                      * cache (PAL's CommandData class). */
+                                     RADEON_FLAG_XCLIPSE_CACHEABLE |
+                                     /* PREFER_LOCAL -> VM_ALWAYS_VALID: keeps IBs out of the
+                                      * per-submit bo_list, so they take no first GART bind (and
+                                      * raw ENG17 flush) per submit. Not shared, so it qualifies. */
+                                     RADEON_FLAG_PREFER_LOCAL_BO;
+
+   if (cs->ws->info.gfx11_shader_core) {
+      struct radeon_winsys_bo *cached = radv_xclipse_ib_cache_get(cs->ws, ib_size);
+      if (cached) {
+         cs->ib_buffer = cached;
+         return VK_SUCCESS;
+      }
+   }
 
    return ws->buffer_create(ws, ib_size, cs->ws->info.ip[cs->hw_ip].ib_alignment, domain, flags, RADV_BO_PRIORITY_CS, 0,
                             &cs->ib_buffer);
@@ -414,28 +480,26 @@ radv_amdgpu_cs_grow(struct ac_cmdbuf *_cs, size_t min_size)
 
    const uint32_t ib_alignment = cs->ws->info.ip[cs->hw_ip].ib_alignment;
 
-   cs->ws->base.cs_finalize(_cs);
+   VkResult result = cs->ws->base.cs_finalize(_cs);
+   if (result != VK_SUCCESS) {
+      cs->base.cdw = 0;
+      return;
+   }
 
    uint64_t ib_size = MAX2(min_size * 4 + 16, cs->base.max_dw * 4 * 2);
 
    ib_size = align(MIN2(ib_size, ~C_3F3_IB_SIZE), ib_alignment);
 
-   VkResult result = radv_amdgpu_cs_bo_create(cs, ib_size);
+   result = radv_amdgpu_cs_bo_create(cs, ib_size);
+   if (result != VK_SUCCESS)
+      goto restore_ib;
 
-   if (result != VK_SUCCESS) {
-      cs->base.cdw = 0;
-      cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      radv_amdgpu_restore_last_ib(cs);
-   }
-
-   cs->ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
-   if (!cs->ib_mapped) {
+   uint8_t *ib_mapped = radv_buffer_map(&cs->ws->base, cs->ib_buffer);
+   if (!ib_mapped) {
       cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffer);
-      cs->base.cdw = 0;
-
       /* VK_ERROR_MEMORY_MAP_FAILED is not valid for vkEndCommandBuffer. */
-      cs->status = VK_ERROR_OUT_OF_DEVICE_MEMORY;
-      radv_amdgpu_restore_last_ib(cs);
+      result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
+      goto restore_ib;
    }
 
    cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
@@ -449,11 +513,23 @@ radv_amdgpu_cs_grow(struct ac_cmdbuf *_cs, size_t min_size)
       cs->ib_size_ptr = cs->base.buf + cs->base.cdw - 1;
    }
 
-   cs->base.buf = (uint32_t *)cs->ib_mapped;
+   cs->ib_mapped = ib_mapped;
+   cs->base.buf = (uint32_t *)ib_mapped;
    cs->base.cdw = 0;
    cs->base.reserved_dw = 0;
    cs->base.max_dw = ib_size / 4 - 4;
    cs->last_cp_dma_header = NULL;
+   return;
+
+restore_ib:
+   /* Finalization transferred the previous BO to ib_buffers. Keep its mapping and
+    * capacity valid for discarded recording after an error; never patch a chain
+    * link with cdw == 0 or publish a failed mapping as the recording buffer.
+    */
+   radv_amdgpu_restore_last_ib(cs);
+   cs->status = result;
+   cs->base.cdw = 0;
+   cs->base.reserved_dw = 0;
 }
 
 static void
@@ -505,6 +581,9 @@ radv_amdgpu_cs_finalize(struct ac_cmdbuf *_cs)
 {
    struct radv_amdgpu_cs *cs = radv_amdgpu_cs(_cs);
 
+   if (cs->status != VK_SUCCESS)
+      return cs->status;
+
    assert(cs->base.cdw <= cs->base.reserved_dw);
 
    if (cs->chain_ib) {
@@ -523,6 +602,10 @@ radv_amdgpu_cs_finalize(struct ac_cmdbuf *_cs)
    /* Append the current (last) IB to the array of IB buffers. */
    radv_amdgpu_cs_add_ib_buffer(cs, cs->ib_buffer, cs->ib_buffer->va,
                                 cs->chain_ib ? G_3F3_IB_SIZE(*cs->ib_size_ptr) : cs->base.cdw);
+
+   /* On allocation failure the array did not take ownership of this BO. */
+   if (cs->status != VK_SUCCESS)
+      return cs->status;
 
    /* Prevent freeing this BO twice. */
    cs->ib_buffer = NULL;
@@ -557,8 +640,17 @@ radv_amdgpu_cs_reset(struct ac_cmdbuf *_cs)
 
    cs->ws->base.cs_add_buffer(&cs->base, cs->ib_buffer);
 
-   for (unsigned i = 0; i < cs->num_ib_buffers; ++i)
-      cs->ws->base.buffer_destroy(&cs->ws->base, cs->ib_buffers[i].bo);
+   /* Park chained IB BOs for reuse rather than destroying them (command buffers reset every
+    * frame). Vulkan forbids resetting a pending command buffer. */
+   for (unsigned i = 0; i < cs->num_ib_buffers; ++i) {
+      struct radeon_winsys_bo *ib_bo = cs->ib_buffers[i].bo;
+      if (!ib_bo)
+         continue;
+      if (cs->ws->info.gfx11_shader_core &&
+          radv_xclipse_ib_cache_put(cs->ws, ib_bo, radv_amdgpu_winsys_bo(ib_bo)->base.size))
+         continue;
+      cs->ws->base.buffer_destroy(&cs->ws->base, ib_bo);
+   }
 
    cs->num_ib_buffers = 0;
    cs->ib.ib_mc_address = radv_amdgpu_winsys_bo(cs->ib_buffer)->base.va;
@@ -682,6 +774,12 @@ radv_amdgpu_cs_add_buffer(struct ac_cmdbuf *_cs, struct radeon_winsys_bo *_bo)
    if (bo->base.is_virtual)
       return;
 
+   /* Skip is_local BOs: VM_ALWAYS_VALID keeps them resident via the kernel's per-VM list (upstream
+    * semantics). Covers is_local imports and PREFER_LOCAL BOs; each one left in the list costs a
+    * first GART bind. */
+   if (bo->base.is_local)
+      return;
+
    radv_amdgpu_cs_add_buffer_internal(cs, bo->bo_handle, bo->priority);
 }
 
@@ -706,6 +804,9 @@ radv_amdgpu_cs_emit_secondary_ib2(struct radv_amdgpu_cs *parent, struct radv_amd
    for (uint32_t i = 0; i < num_ib2; ++i) {
       if (parent->base.cdw + 4 > parent->base.max_dw)
          radv_amdgpu_cs_grow(&parent->base, 4);
+
+      if (parent->status != VK_SUCCESS)
+         return;
 
       parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + 4);
 
@@ -751,6 +852,9 @@ radv_amdgpu_cs_execute_secondary(struct ac_cmdbuf *_parent, struct ac_cmdbuf *_c
 
          if (parent->base.cdw + cdw > parent->base.max_dw)
             radv_amdgpu_cs_grow(&parent->base, cdw);
+
+         if (parent->status != VK_SUCCESS)
+            return;
 
          parent->base.reserved_dw = MAX2(parent->base.reserved_dw, parent->base.cdw + cdw);
 
@@ -823,7 +927,8 @@ radv_amdgpu_cs_chain_dgc_ib(struct ac_cmdbuf *_cs, uint64_t va, uint32_t cdw, ui
       }
 
       /* Finalize the current CS. */
-      cs->ws->base.cs_finalize(_cs);
+      if (cs->ws->base.cs_finalize(_cs) != VK_SUCCESS)
+         return;
 
       /* Chain the current CS to the DGC CS. */
       _cs->buf[_cs->cdw - 4] = PKT3(PKT3_INDIRECT_BUFFER, 2, 0);
@@ -992,6 +1097,24 @@ radv_amdgpu_get_bo_list(struct radv_amdgpu_winsys *ws, struct ac_cmdbuf **cs_arr
 
    *rhandles = handles;
    *rnum_handles = num_handles;
+
+   /* BO list size per submit (RADV_KILL tag): every entry not yet GART-resident is bound
+    * in amdgpu_cs_parser_bos, each with a raw ENG17 flush.
+    * Capture: logcat -s RADV_KILL:I | while IFS= read -r l; do echo "$l" >> f; done
+    * Reports the first submit, every 64th, and each new high-water mark. */
+   {
+      static uint32_t n_submit, hiwater;
+      uint32_t n = p_atomic_inc_return(&n_submit);
+      bool peak = num_handles > hiwater;
+      if (peak)
+         hiwater = num_handles;
+      /* First 16 individually: the cold-bind window is a few submits wide. */
+      if (n <= 16 || (n & 0x3f) == 0 || peak) {
+         AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_KILL",
+                             "[SUBMIT] n=%u bos=%u peak=%u%s", n, num_handles, hiwater,
+                             n == 1 ? " FIRST" : (peak ? " NEW-PEAK" : ""));
+      }
+   }
 
    return VK_SUCCESS;
 }
@@ -1207,8 +1330,12 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
             return VK_ERROR_DEVICE_LOST;
          }
 
-         sync_accumulate("radv", &fd, fd2);
+         ret = sync_accumulate("radv", &fd, fd2);
          close(fd2);
+         if (ret < 0) {
+            close(fd);
+            return VK_ERROR_DEVICE_LOST;
+         }
       }
       for (unsigned i = 0; i < sem_info->wait.timeline_syncobj_count; ++i) {
          int fd2;
@@ -1229,8 +1356,12 @@ radv_amdgpu_cs_submit_zero(struct radv_amdgpu_ctx *ctx, enum amd_ip_type ip_type
             return VK_ERROR_DEVICE_LOST;
          }
 
-         sync_accumulate("radv", &fd, fd2);
+         ret = sync_accumulate("radv", &fd, fd2);
          close(fd2);
+         if (ret < 0) {
+            close(fd);
+            return VK_ERROR_DEVICE_LOST;
+         }
       }
       ret = ac_drm_cs_syncobj_import_sync_file(ctx->ws->dev, queue_syncobj, fd);
       close(fd);
@@ -1592,6 +1723,10 @@ radv_amdgpu_ctx_destroy(struct radeon_winsys_ctx *rwctx)
             ac_drm_cs_destroy_syncobj(ctx->ws->dev, ctx->queue_syncobj[ip][ring]);
       }
    }
+   for (unsigned ring = 0; ring < MAX_RINGS_PER_TYPE; ++ring) {
+      if (ctx->xclipse_pace[ring].syncobj)
+         ac_drm_cs_destroy_syncobj(ctx->ws->dev, ctx->xclipse_pace[ring].syncobj);
+   }
 
    ctx->ws->base.buffer_destroy(&ctx->ws->base, ctx->fence_bo);
    ac_drm_cs_ctx_free(ctx->ws->dev, ctx->ctx_handle);
@@ -1701,9 +1836,11 @@ radv_amdgpu_cs_alloc_syncobj_chunk(struct radv_winsys_sem_counts *counts, uint32
 
 static void *
 radv_amdgpu_cs_alloc_timeline_syncobj_chunk(struct radv_winsys_sem_counts *counts, uint32_t queue_syncobj,
-                                            struct drm_amdgpu_cs_chunk *chunk, int chunk_id)
+                                            struct drm_amdgpu_cs_chunk *chunk, int chunk_id, uint32_t pace_syncobj,
+                                            uint64_t pace_point)
 {
-   uint32_t count = counts->syncobj_count + counts->timeline_syncobj_count + (queue_syncobj ? 1 : 0);
+   uint32_t count = counts->syncobj_count + counts->timeline_syncobj_count + (queue_syncobj ? 1 : 0) +
+                    (pace_syncobj ? 1 : 0);
    struct drm_amdgpu_cs_chunk_syncobj *syncobj = malloc(sizeof(struct drm_amdgpu_cs_chunk_syncobj) * count);
    if (!syncobj)
       return NULL;
@@ -1723,9 +1860,15 @@ radv_amdgpu_cs_alloc_timeline_syncobj_chunk(struct radv_winsys_sem_counts *count
    }
 
    if (queue_syncobj) {
-      syncobj[count - 1].handle = queue_syncobj;
+      syncobj[counts->syncobj_count + counts->timeline_syncobj_count].handle = queue_syncobj;
+      syncobj[counts->syncobj_count + counts->timeline_syncobj_count].flags = 0;
+      syncobj[counts->syncobj_count + counts->timeline_syncobj_count].point = 0;
+   }
+
+   if (pace_syncobj) {
+      syncobj[count - 1].handle = pace_syncobj;
       syncobj[count - 1].flags = 0;
-      syncobj[count - 1].point = 0;
+      syncobj[count - 1].point = pace_point;
    }
 
    chunk->chunk_id = chunk_id;
@@ -1734,12 +1877,158 @@ radv_amdgpu_cs_alloc_timeline_syncobj_chunk(struct radv_winsys_sem_counts *count
    return syncobj;
 }
 
+/* Do not attach a user fence to graphics submits (0x73a0).
+ *
+ *     VENDOR  [IB IB IB    TL_SIGNAL BO_HANDLES]   <- no FENCE chunk
+ *     RADV    [IB IB FENCE TL_SIGNAL BO_HANDLES]
+ *
+ * In the sgpu kernel the FENCE chunk (amdgpu_cs_user_fence_chunk) makes amdgpu_cs.c:748 call
+ * amdgpu_ttm_alloc_gart() on the fence BO: the only CS-time GART bind (and raw ENG17 flush) a
+ * graphics submit can reach (amdgpu_cs_find_mapping's is UVD/VCE only). Without it, like PAL,
+ * graphics submits never GART-bind.
+ *
+ * Nothing in RADV reads the fence values: completion uses the TL_SIGNAL syncobj, and context reset
+ * uses CTX_OP_QUERY_STATE.
+ * RADV_XCLIPSE_UF=1 or debug.radv_xclipse_uf 1 restores the user fence. */
 static bool
-radv_amdgpu_cs_has_user_fence(struct radv_amdgpu_cs_request *request)
+radv_xclipse_user_fence_enabled(struct radv_amdgpu_ctx *ctx)
 {
+   if (ctx->ws->info.pci_id != 0x73a0)
+      return true; /* not our chip: stock */
+
+   static int uf = -1;
+   if (uf < 0) {
+      const char *e = getenv("RADV_XCLIPSE_UF");
+#ifdef __ANDROID__
+      char v[PROP_VALUE_MAX] = {0};
+      uf = e ? atoi(e) : (__system_property_get("debug.radv_xclipse_uf", v) > 0 ? atoi(v) : 0);
+#else
+      uf = e ? atoi(e) : 0;
+#endif
+      AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[ARM] user_fence=%d (%s)", uf, e ? "env" : "prop/default");
+   }
+   return uf != 0;
+}
+
+static bool
+radv_amdgpu_cs_has_user_fence(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request *request)
+{
+   if (!radv_xclipse_user_fence_enabled(ctx))
+      return false;
+
    return request->ip_type != AMDGPU_HW_IP_UVD && request->ip_type != AMDGPU_HW_IP_VCE &&
           request->ip_type != AMDGPU_HW_IP_UVD_ENC && request->ip_type != AMDGPU_HW_IP_VCN_DEC &&
           request->ip_type != AMDGPU_HW_IP_VCN_ENC && request->ip_type != AMDGPU_HW_IP_VCN_JPEG;
+}
+
+/* Keep the Android UI responsive while an uncapped app saturates the GPU (Xclipse 920 only).
+ *
+ * The 920's kernel has mid-command-buffer preemption off (amdgpu_mcbp = 0; the 530's has it on)
+ * and puts up to 4 jobs on the one GFX ring (amdgpu_sched_hw_submission = 4). Once a job is on the
+ * ring nothing gets ahead of it, whatever the context priority. SurfaceFlinger and every app's
+ * RenderThread share that ring, so with vsync off each of their GPU jobs waits behind up to 4 of
+ * ours: with 8 ms jobs a tiny job from another process waited 32 ms (probe/gfx/uilat), and the
+ * whole UI stutters. The vendor driver measures the same.
+ *
+ * Each GFX job signals point n of a per-ring timeline syncobj. When two of our jobs are still
+ * pending and the jobs are long, job n also waits for point n - 2. A timeline wait reaches the
+ * scheduler as a dma_fence_chain, which it cannot shortcut (it would only wait for a same-ring job
+ * to be *scheduled*, or ignore a fence from the same entity), so job n stays in the scheduler
+ * queue until job n - 2 has finished. At most 2 of our jobs sit on the ring, and work from other
+ * processes gets on behind those 2. The app thread never blocks.
+ *
+ * uilat with 8 ms jobs: wait 32 -> 16 ms, throughput unchanged. Below about 0.5 ms per job the
+ * scheduler cannot refill the ring in time and throughput drops (0.07 ms jobs: -36%), so pacing
+ * only engages when the mean submit interval is at least 0.5 ms. When the GPU is the bottleneck
+ * that interval is the mean job length; when it is not, job n - 2 has already finished and the
+ * poll below adds no wait.
+ *
+ * RADV_XCLIPSE_PACE=0 or debug.radv_xclipse_pace 0 turns it off; 2 paces every job whatever its
+ * length (for testing the dependency path). */
+#define RADV_XCLIPSE_PACE_MIN_NS 500000ull
+
+/* 0 off, 1 on, 2 forced */
+static int
+radv_xclipse_pace_mode(struct radv_amdgpu_ctx *ctx)
+{
+   /* Only the 920 needs it (the 530's kernel preempts, so its UI never waits behind our jobs). */
+   if (!ac_xclipse_chip_info(&ctx->ws->info)->submit_pacing || !ctx->ws->info.has_timeline_syncobj)
+      return 0;
+
+   static int pace = -1;
+   if (pace < 0) {
+      const char *e = getenv("RADV_XCLIPSE_PACE");
+      if (e && !*e)
+         e = NULL;
+#ifdef __ANDROID__
+      char v[PROP_VALUE_MAX] = {0};
+      pace = e ? atoi(e) : (__system_property_get("debug.radv_xclipse_pace", v) > 0 ? atoi(v) : 1);
+#else
+      pace = e ? atoi(e) : 1;
+#endif
+      AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[ARM] pace=%d (%s)", pace, e ? "env" : "prop/default");
+   }
+   return pace;
+}
+
+static void
+radv_xclipse_pace_begin(struct radv_amdgpu_ctx *ctx, const struct radv_amdgpu_cs_request *request,
+                        uint32_t *syncobj, uint64_t *wait_point, uint64_t *signal_point)
+{
+   *syncobj = 0;
+   *wait_point = 0;
+   *signal_point = 0;
+
+   if (request->ip_type != AMDGPU_HW_IP_GFX || request->ring >= MAX_RINGS_PER_TYPE)
+      return;
+   const int mode = radv_xclipse_pace_mode(ctx);
+   if (!mode)
+      return;
+   const uint64_t min_ns = mode >= 2 ? 0 : RADV_XCLIPSE_PACE_MIN_NS;
+
+   struct radv_xclipse_pace *p = &ctx->xclipse_pace[request->ring];
+   if (!p->syncobj && ac_drm_cs_create_syncobj2(ctx->ws->dev, 0, &p->syncobj)) {
+      p->syncobj = 0;
+      return;
+   }
+
+   /* Mean submit interval, idle gaps clamped. Under backlog it is the mean job length. */
+   const uint64_t now = os_time_get_nano();
+   const uint64_t dt = MIN2(now - p->last_ns, 100000000ull);
+   p->avg_ns = p->avg_ns - p->avg_ns / 8 + dt / 8;
+   p->last_ns = now;
+
+   /* Short jobs: no poll and no timeline point, they cost about 4 us per submit. Points are
+    * kept from half the threshold up so that two exist by the time pacing can engage. */
+   if (p->avg_ns < min_ns / 2)
+      return;
+
+   if (p->count >= 2 && p->avg_ns >= min_ns) {
+      /* Has job n - 2 finished? A zero absolute timeout only polls. */
+      uint32_t expired = 1;
+      int r = ac_drm_cs_query_fence_status(ctx->ws->dev, ctx->ctx_handle, AMDGPU_HW_IP_GFX, 0, request->ring,
+                                           p->seq[(p->count - 1) & 1], 0, AMDGPU_QUERY_FENCE_TIMEOUT_IS_ABSOLUTE,
+                                           &expired);
+      if (!r && !expired) {
+         *wait_point = p->count - 1;
+
+         static uint32_t n_paced;
+         if ((p_atomic_inc_return(&n_paced) & 1023) == 1)
+            AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_ARM", "[PACE] paced=%u avg=%.2f ms", n_paced, p->avg_ns / 1e6);
+      }
+   }
+
+   *syncobj = p->syncobj;
+   *signal_point = p->count + 1;
+}
+
+static void
+radv_xclipse_pace_end(struct radv_amdgpu_ctx *ctx, const struct radv_amdgpu_cs_request *request,
+                      uint64_t signal_point)
+{
+   struct radv_xclipse_pace *p = &ctx->xclipse_pace[request->ring];
+   p->seq[signal_point & 1] = request->seq_no;
+   p->count = signal_point;
 }
 
 static VkResult
@@ -1753,16 +2042,21 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
    struct drm_amdgpu_cs_chunk_data *chunk_data;
    struct drm_amdgpu_bo_list_in bo_list_in;
    void *wait_syncobj = NULL, *signal_syncobj = NULL;
+   struct drm_amdgpu_cs_chunk_syncobj pace_wait_chunk;
    int i;
    VkResult result = VK_SUCCESS;
-   bool has_user_fence = radv_amdgpu_cs_has_user_fence(request);
+   bool has_user_fence = radv_amdgpu_cs_has_user_fence(ctx, request);
    uint32_t queue_syncobj = radv_amdgpu_ctx_queue_syncobj(ctx, request->ip_type, request->ring);
    bool *queue_syncobj_wait = &ctx->queue_syncobj_wait[request->ip_type][request->ring];
+   uint32_t pace_syncobj;
+   uint64_t pace_wait, pace_signal;
 
    if (!queue_syncobj)
       return VK_ERROR_OUT_OF_HOST_MEMORY;
 
-   size = request->number_of_ibs + 1 + (has_user_fence ? 1 : 0) + 1 /* bo list */ + 3;
+   radv_xclipse_pace_begin(ctx, request, &pace_syncobj, &pace_wait, &pace_signal);
+
+   size = request->number_of_ibs + 1 + (has_user_fence ? 1 : 0) + 1 /* bo list */ + 3 + 1 /* pace wait */;
 
    chunks = malloc(sizeof(chunks[0]) * size);
    if (!chunks)
@@ -1820,7 +2114,7 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
 
       if (ctx->ws->info.has_timeline_syncobj) {
          wait_syncobj = radv_amdgpu_cs_alloc_timeline_syncobj_chunk(
-            &sem_info->wait, queue_wait_syncobj, &chunks[num_chunks], AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT);
+            &sem_info->wait, queue_wait_syncobj, &chunks[num_chunks], AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT, 0, 0);
       } else {
          wait_syncobj = radv_amdgpu_cs_alloc_syncobj_chunk(&sem_info->wait, queue_wait_syncobj, &chunks[num_chunks],
                                                            AMDGPU_CHUNK_ID_SYNCOBJ_IN);
@@ -1835,10 +2129,25 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       *queue_syncobj_wait = false;
    }
 
+   if (pace_wait) {
+      /* Its own chunk: the kernel takes any number of wait chunks. */
+      pace_wait_chunk.handle = pace_syncobj;
+      pace_wait_chunk.flags = 0;
+      pace_wait_chunk.point = pace_wait;
+      chunks[num_chunks].chunk_id = AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_WAIT;
+      chunks[num_chunks].length_dw = sizeof(pace_wait_chunk) / 4;
+      chunks[num_chunks].chunk_data = (uint64_t)(uintptr_t)&pace_wait_chunk;
+      num_chunks++;
+   }
+
+   /* The kernel takes one signal chunk per CS, so the pace point rides in this one. pace_syncobj is
+    * only set with timeline syncobjs, and cs_emit_signal is always set. */
+   assert(!pace_syncobj || sem_info->cs_emit_signal);
    if (sem_info->cs_emit_signal) {
       if (ctx->ws->info.has_timeline_syncobj) {
          signal_syncobj = radv_amdgpu_cs_alloc_timeline_syncobj_chunk(
-            &sem_info->signal, queue_syncobj, &chunks[num_chunks], AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL);
+            &sem_info->signal, queue_syncobj, &chunks[num_chunks], AMDGPU_CHUNK_ID_SYNCOBJ_TIMELINE_SIGNAL,
+            pace_syncobj, pace_signal);
       } else {
          signal_syncobj = radv_amdgpu_cs_alloc_syncobj_chunk(&sem_info->signal, queue_syncobj, &chunks[num_chunks],
                                                              AMDGPU_CHUNK_ID_SYNCOBJ_OUT);
@@ -1867,6 +2176,10 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
     */
    uint64_t abs_timeout_ns = os_time_get_absolute_timeout(1000000000ull); /* 1s */
 
+   /* Submit ioctl cost for perf accounting. Off by default. */
+   const bool xperf = vk_xclipse_perf_enabled();
+   const uint64_t xperf_t0 = xperf ? os_time_get_nano() : 0;
+
    r = 0;
    do {
       /* Wait 1 ms and try again. */
@@ -1876,7 +2189,14 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
       r = ac_drm_cs_submit_raw2(ctx->ws->dev, ctx->ctx_handle, 0, num_chunks, chunks, &request->seq_no);
    } while (r == -ENOMEM && os_time_get_nano() < abs_timeout_ns);
 
+   if (xperf)
+      vk_xclipse_perf_submit(os_time_get_nano() - xperf_t0);
+
    if (r) {
+      /* Read the GPU busy/stall registers right after the GPU refused work. No BO, no CS, no
+       * GFXHUB flush. The kernel's hang check does not look at the CP_* and UTCL2_* fields. */
+      ac_drm_dump_gpu_status(ctx->ws->dev, "submit-failed");
+
       if (r == -ENOMEM) {
          fprintf(stderr, "radv/amdgpu: Not enough memory for command submission.\n");
          result = VK_ERROR_OUT_OF_HOST_MEMORY;
@@ -1899,6 +2219,8 @@ radv_amdgpu_cs_submit(struct radv_amdgpu_ctx *ctx, struct radv_amdgpu_cs_request
                  r);
          result = VK_ERROR_UNKNOWN;
       }
+   } else if (pace_signal) {
+      radv_xclipse_pace_end(ctx, request, pace_signal);
    }
 
 error_out:

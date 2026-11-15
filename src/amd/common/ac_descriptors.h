@@ -369,6 +369,11 @@ struct ac_sampler_state {
    unsigned min_filter : 2;
    unsigned mip_filter : 2;
    unsigned aniso_single_level : 1;
+   /* Xclipse: PERF_MIP, ANISO_THRESHOLD and ANISO_BIAS come from ac_xclipse_texture_filter_opt().
+    * The vendor's S# has PERF_MIP 15 and the AMD threshold/bias on every sampler and turns them
+    * off per texture with PERF_MOD 0. probe/gfx/texfx samples a 256x256 mip chain, where the vendor
+    * filters exactly: that is why zeros here once looked like the vendor's values. */
+   unsigned xclipse_aniso : 1;
    unsigned border_color_type : 2;
    unsigned border_color_ptr : 12;
    float min_lod;
@@ -429,6 +434,9 @@ struct ac_texture_state {
    uint32_t tc_compat_htile_enabled : 1;
    uint32_t aniso_single_level : 1;
 };
+
+bool
+ac_xclipse_native_texture_format(const struct radeon_info *info, enum pipe_format format);
 
 void
 ac_build_texture_descriptor(const struct radeon_info *info,
