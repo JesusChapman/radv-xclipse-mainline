@@ -5,6 +5,8 @@
  * SPDX-License-Identifier: MIT
  */
 
+#include "util/u_gralloc/u_gralloc_xclipse_dump.h"
+#include "ac_xclipse_log.h"
 #include "radv_android.h"
 #include "ac_drm_fourcc.h"
 #include "radv_buffer.h"
@@ -21,16 +23,184 @@
 #include <unistd.h>
 #endif /* VK_USE_PLATFORM_ANDROID_KHR */
 
+#include "drm-uapi/drm_fourcc.h"
 #include "util/os_file.h"
 
 #include "vk_android.h"
 #include "vk_format.h"
+#include "vk_common_entrypoints.h"
 #include "vk_log.h"
 #include "vk_util.h"
+#include "vk_xclipse_perf.h"
+#include "util/u_xclipse_prof.h"
 
 #define RADV_ANDROID_MAX_PLANES 4
 
 #ifdef VK_USE_PLATFORM_ANDROID_KHR
+
+/* Safety net when vk_android_get_anb_layout() fails (e.g. an unknown gralloc handle revision):
+ * without a layout RADV would invent align(width,64) and write rows at the wrong pitch. Scan the
+ * private handle for the (width, height) pair and a stride validated against the dma_buf size.
+ * Returns bytes, or 0 if nothing checks out.
+ */
+static uint64_t
+radv_anb_derive_stride_bytes(const native_handle_t *hnd, const VkImageCreateInfo *base_info,
+                             int dma_buf, uint32_t bpe)
+{
+   const int *ints = &hnd->data[hnd->numFds];
+   const uint32_t w = base_info->extent.width, h = base_info->extent.height;
+   const off_t bo_size = lseek(dma_buf, 0, SEEK_END);
+
+   if (bo_size <= 0 || !bpe)
+      return 0;
+
+   for (int i = 0; i + 1 < hnd->numInts; i++) {
+      if ((uint32_t)ints[i] != w || (uint32_t)ints[i + 1] != h)
+         continue;
+
+      /* (stride, vstride) is a few slots past the (w, h) anchor, not at a fixed offset. Accept a
+       * pair only if stride*vstride*bpe also appears in the handle as the total size. */
+      for (int j = i + 2; j < i + 10 && j + 1 < hnd->numInts; j++) {
+         const int64_t stride = ints[j], vstride = ints[j + 1];
+         if (stride < (int64_t)w || vstride < (int64_t)h)
+            continue;
+
+         const int64_t total = stride * vstride * (int64_t)bpe;
+         if (total > (int64_t)bo_size)
+            continue;
+
+         bool corroborated = false;
+         for (int k = 0; k < hnd->numInts && !corroborated; k++)
+            corroborated = (int64_t)ints[k] == total;
+         if (!corroborated)
+            continue;
+
+         /* Logged once (debug.radv_xclipse_log >= 1): this changes the layout. */
+         static bool announced = false;
+         if (!announced) {
+            announced = true;
+            if (ac_xclipse_log_level() >= 1)
+               mesa_logi("[ANB-STRIDE] recovered from private handle: anchor(w,h) at int %d, stride=%" PRId64
+                      " vstride=%" PRId64 " at int %d, corroborated by total=%" PRId64
+                      " in the handle (BO is %lld B) -> rowPitch=%" PRId64 " B",
+                      i, stride, vstride, j, total, (long long)bo_size, stride * bpe);
+         }
+         return (uint64_t)stride * bpe;
+      }
+   }
+
+   mesa_loge("[ANB-STRIDE] could not recover a stride from the private handle (numInts=%d, %ux%u) -- "
+             "NOT overriding; the surface will use RADV's own alignment and may be sheared",
+             hnd->numInts, w, h);
+   return 0;
+}
+
+/* vk_android_get_anb_layout() failed: synthesize a LINEAR layout with the stride recovered from
+ * the private handle. Returns `failed` unchanged when no stride checks out. */
+static VkResult
+radv_anb_synth_linear_layout(const native_handle_t *hnd, const VkImageCreateInfo *info, VkResult failed,
+                             VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_info, VkSubresourceLayout *layouts)
+{
+   const uint32_t bpe = vk_format_get_blocksize(info->format);
+   const uint64_t row_pitch = radv_anb_derive_stride_bytes(hnd, info, hnd->data[0], bpe);
+   if (!row_pitch)
+      return failed;
+
+   layouts[0] = (VkSubresourceLayout){.offset = 0, .size = 0, .rowPitch = row_pitch};
+   *mod_info = (VkImageDrmFormatModifierExplicitCreateInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+      .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+      .drmFormatModifierPlaneCount = 1,
+      .pPlaneLayouts = layouts,
+   };
+   if (ac_xclipse_log_level() >= 1)
+      mesa_logi("[ANB] gralloc layout query failed (%d) -- SYNTHESIZED a linear layout with "
+                "rowPitch=%" PRIu64 " B from the private handle", failed, row_pitch);
+   return VK_SUCCESS;
+}
+
+
+/* Safety net when vk_android_get_anb_layout() fails (e.g. an unknown gralloc handle revision):
+ * without a layout RADV would invent align(width,64) and write rows at the wrong pitch. Scan the
+ * private handle for the (width, height) pair and a stride validated against the dma_buf size.
+ * Returns bytes, or 0 if nothing checks out.
+ */
+static uint64_t
+radv_anb_derive_stride_bytes(const native_handle_t *hnd, const VkImageCreateInfo *base_info,
+                             int dma_buf, uint32_t bpe)
+{
+   const int *ints = &hnd->data[hnd->numFds];
+   const uint32_t w = base_info->extent.width, h = base_info->extent.height;
+   const off_t bo_size = lseek(dma_buf, 0, SEEK_END);
+
+   if (bo_size <= 0 || !bpe)
+      return 0;
+
+   for (int i = 0; i + 1 < hnd->numInts; i++) {
+      if ((uint32_t)ints[i] != w || (uint32_t)ints[i + 1] != h)
+         continue;
+
+      /* (stride, vstride) is a few slots past the (w, h) anchor, not at a fixed offset. Accept a
+       * pair only if stride*vstride*bpe also appears in the handle as the total size. */
+      for (int j = i + 2; j < i + 10 && j + 1 < hnd->numInts; j++) {
+         const int64_t stride = ints[j], vstride = ints[j + 1];
+         if (stride < (int64_t)w || vstride < (int64_t)h)
+            continue;
+
+         const int64_t total = stride * vstride * (int64_t)bpe;
+         if (total > (int64_t)bo_size)
+            continue;
+
+         bool corroborated = false;
+         for (int k = 0; k < hnd->numInts && !corroborated; k++)
+            corroborated = (int64_t)ints[k] == total;
+         if (!corroborated)
+            continue;
+
+         /* Logged once (debug.radv_xclipse_log >= 1): this changes the layout. */
+         static bool announced = false;
+         if (!announced) {
+            announced = true;
+            if (ac_xclipse_log_level() >= 1)
+               mesa_logi("[ANB-STRIDE] recovered from private handle: anchor(w,h) at int %d, stride=%" PRId64
+                      " vstride=%" PRId64 " at int %d, corroborated by total=%" PRId64
+                      " in the handle (BO is %lld B) -> rowPitch=%" PRId64 " B",
+                      i, stride, vstride, j, total, (long long)bo_size, stride * bpe);
+         }
+         return (uint64_t)stride * bpe;
+      }
+   }
+
+   mesa_loge("[ANB-STRIDE] could not recover a stride from the private handle (numInts=%d, %ux%u) -- "
+             "NOT overriding; the surface will use RADV's own alignment and may be sheared",
+             hnd->numInts, w, h);
+   return 0;
+}
+
+/* vk_android_get_anb_layout() failed: synthesize a LINEAR layout with the stride recovered from
+ * the private handle. Returns `failed` unchanged when no stride checks out. */
+static VkResult
+radv_anb_synth_linear_layout(const native_handle_t *hnd, const VkImageCreateInfo *info, VkResult failed,
+                             VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_info, VkSubresourceLayout *layouts)
+{
+   const uint32_t bpe = vk_format_get_blocksize(info->format);
+   const uint64_t row_pitch = radv_anb_derive_stride_bytes(hnd, info, hnd->data[0], bpe);
+   if (!row_pitch)
+      return failed;
+
+   layouts[0] = (VkSubresourceLayout){.offset = 0, .size = 0, .rowPitch = row_pitch};
+   *mod_info = (VkImageDrmFormatModifierExplicitCreateInfoEXT){
+      .sType = VK_STRUCTURE_TYPE_IMAGE_DRM_FORMAT_MODIFIER_EXPLICIT_CREATE_INFO_EXT,
+      .drmFormatModifier = DRM_FORMAT_MOD_LINEAR,
+      .drmFormatModifierPlaneCount = 1,
+      .pPlaneLayouts = layouts,
+   };
+   if (ac_xclipse_log_level() >= 1)
+      mesa_logi("[ANB] gralloc layout query failed (%d) -- SYNTHESIZED a linear layout with "
+                "rowPitch=%" PRIu64 " B from the private handle", failed, row_pitch);
+   return VK_SUCCESS;
+}
+
 
 static VkResult
 radv_gralloc_import_memory(VkDevice device_h, const VkNativeBufferANDROID *gralloc_info,
@@ -52,6 +222,8 @@ radv_gralloc_import_memory(VkDevice device_h, const VkNativeBufferANDROID *grall
     */
    int dma_buf = gralloc_info->handle->data[0];
    assert(dma_buf >= 0);
+
+   u_gralloc_xclipse_dump("radv", gralloc_info->handle);
 
    int dup_fd = os_dupfd_cloexec(dma_buf);
    if (dup_fd < 0)
@@ -130,10 +302,16 @@ radv_image_from_gralloc(VkDevice device_h, const VkImageCreateInfo *base_info,
    VkSubresourceLayout layouts[RADV_ANDROID_MAX_PLANES];
    assert(vk_find_struct_const(base_info->pNext, NATIVE_BUFFER_ANDROID));
    result = vk_android_get_anb_layout(base_info, &mod_info, layouts, RADV_ANDROID_MAX_PLANES);
+
+   if (result != VK_SUCCESS)
+      result = radv_anb_synth_linear_layout(gralloc_info->handle, base_info, result, &mod_info, layouts);
    if (result == VK_SUCCESS) {
       mod_info.pNext = updated_base_info.pNext;
       updated_base_info.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT;
       updated_base_info.pNext = &mod_info;
+   } else {
+      if (ac_xclipse_log_level() >= 1)
+         mesa_logi("[ANB] vk_android_get_anb_layout failed = %d (falling back to non-modifier path)", result);
    }
 
    result = radv_image_create(device_h,
@@ -177,6 +355,20 @@ fail_create_image:
    return result;
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL
+radv_QueueSignalReleaseImageANDROID(VkQueue queue_h, uint32_t waitSemaphoreCount,
+                                    const VkSemaphore *pWaitSemaphores, VkImage image_h,
+                                    int *pNativeFenceFd)
+{
+   /* The frame boundary on Android: the platform loader implements VK_KHR_swapchain and drives the
+    * ICD through VK_ANDROID_native_buffer, so wsi_QueuePresentKHR is never reached. */
+   vk_xclipse_perf_present();
+   u_xclipse_prof_frame();
+
+   return vk_common_QueueSignalReleaseImageANDROID(queue_h, waitSemaphoreCount, pWaitSemaphores,
+                                                   image_h, pNativeFenceFd);
+}
+
 VkResult
 radv_android_get_wsi_memory(VkDevice device_h, const VkBindImageMemoryInfo *bind_info, VkDeviceMemory *out_memory_h)
 {
@@ -207,6 +399,8 @@ radv_android_get_wsi_memory(VkDevice device_h, const VkBindImageMemoryInfo *bind
    create_info->pNext = &local_anb;
 
    result = vk_android_get_anb_layout(create_info, &mod_info, layouts, RADV_ANDROID_MAX_PLANES);
+   if (result != VK_SUCCESS)
+      result = radv_anb_synth_linear_layout(anb->handle, create_info, result, &mod_info, layouts);
    if (result != VK_SUCCESS)
       goto restore_create_info;
 
@@ -532,23 +726,52 @@ radv_import_ahb_memory(struct radv_device *device, struct radv_device_memory *me
       VkImageDrmFormatModifierExplicitCreateInfoEXT *mod_info_p = NULL;
       VkImageDrmFormatModifierExplicitCreateInfoEXT mod_info;
       VkSubresourceLayout layouts[RADV_ANDROID_MAX_PLANES];
-      result = vk_android_get_ahb_layout(buffer, &mod_info, layouts, RADV_ANDROID_MAX_PLANES);
+      int plane_fds[RADV_ANDROID_MAX_PLANES] = {0};
+      result = vk_android_get_ahb_layout_fds(buffer, &mod_info, layouts, RADV_ANDROID_MAX_PLANES, plane_fds);
       if (result == VK_SUCCESS)
          mod_info_p = &mod_info;
 
+      /* Planes in a dma-buf of their own (Samsung NV12M) get their own BO, and the image is made
+       * disjoint so each plane is addressed from its binding; radv_BindImageMemory2() binds them. */
+      bool fd_planes = false;
+      for (unsigned i = 1; mod_info_p && i < mod_info.drmFormatModifierPlaneCount; i++) {
+         if (plane_fds[i] == plane_fds[0])
+            continue;
+         uint64_t plane_size = 0;
+         result = device->ws->buffer_from_fd(device->ws, plane_fds[i], priority, &mem->ahb_plane_bo[i - 1],
+                                             &plane_size);
+         if (result == VK_SUCCESS && plane_size < layouts[i].offset + layouts[i].rowPitch *
+                                                     DIV_ROUND_UP(mem->image->vk.extent.height, 2))
+            result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
+         if (result != VK_SUCCESS) {
+            for (unsigned j = 0; j < ARRAY_SIZE(mem->ahb_plane_bo); j++) {
+               if (mem->ahb_plane_bo[j])
+                  radv_bo_destroy(device, NULL, mem->ahb_plane_bo[j]);
+               mem->ahb_plane_bo[j] = NULL;
+            }
+            radv_bo_destroy(device, NULL, mem->bo);
+            mem->bo = NULL;
+            return result;
+         }
+         fd_planes = true;
+      }
+
       const uint64_t modifier = mod_info_p ? mod_info.drmFormatModifier : DRM_FORMAT_MOD_INVALID;
       result = radv_image_init_layout(device, create_info, modifier, mod_info_p, NULL, mem->image);
+      if (result == VK_SUCCESS && alloc_size < mem->image->size)
+         result = VK_ERROR_INVALID_EXTERNAL_HANDLE;
       if (result != VK_SUCCESS) {
+         for (unsigned j = 0; j < ARRAY_SIZE(mem->ahb_plane_bo); j++) {
+            if (mem->ahb_plane_bo[j])
+               radv_bo_destroy(device, NULL, mem->ahb_plane_bo[j]);
+            mem->ahb_plane_bo[j] = NULL;
+         }
          radv_bo_destroy(device, NULL, mem->bo);
          mem->bo = NULL;
          return result;
       }
-
-      if (alloc_size < mem->image->size) {
-         radv_bo_destroy(device, NULL, mem->bo);
-         mem->bo = NULL;
-         return VK_ERROR_INVALID_EXTERNAL_HANDLE;
-      }
+      if (fd_planes)
+         mem->image->disjoint = true;
    } else if (mem->buffer) {
       if (alloc_size < mem->buffer->vk.size) {
          radv_bo_destroy(device, NULL, mem->bo);
