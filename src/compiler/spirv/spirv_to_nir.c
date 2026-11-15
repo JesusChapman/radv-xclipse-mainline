@@ -142,6 +142,7 @@ static const struct spirv_capabilities implemented_capabilities = {
    .PerViewAttributesNV = true,
    .PhysicalStorageBufferAddresses = true,
    .QuadControlKHR = true,
+   .RawAccessChainsNV = true,
    .RayCullMaskKHR = true,
    .RayQueryKHR = true,
    .RayQueryPositionFetchKHR = true,
@@ -164,6 +165,9 @@ static const struct spirv_capabilities implemented_capabilities = {
    .ShaderClockKHR = true,
    .ShaderEnqueueAMDX = true,
    .ShaderLayer = true,
+   /* SPV_NV_geometry_shader_passthrough: PassthroughNV is recorded on the variable
+    * (nir_variable_data::passthrough); the driver lowers it (radv_nir_lower_passthrough_gs.c). */
+   .GeometryShaderPassthroughNV = true,
    .ShaderNonUniformEXT = true,
    .ShaderSMBuiltinsNV = true,
    .ShaderViewportIndex = true,
@@ -6387,6 +6391,7 @@ vtn_handle_body_instruction(struct vtn_builder *b, SpvOp opcode,
    case SpvOpUntypedInBoundsPtrAccessChainKHR:
    case SpvOpUntypedArrayLengthKHR:
    case SpvOpBufferPointerEXT:
+   case SpvOpRawAccessChainNV:
       vtn_handle_variables(b, opcode, w, count);
       break;
 
