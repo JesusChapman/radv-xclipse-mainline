@@ -158,7 +158,43 @@ struct aco_compiler_options {
    bool wgp_mode;
    bool is_opengl;
    enum radeon_family family;
+   /* The ISA to emit. On Xclipse 920 this is GFX11 while the hardware is RDNA2, so it does not by
+    * itself imply any RDNA3 hardware capability; those get their own flags below. */
    enum amd_gfx_level gfx_level;
+   /* Dual-issue VALU (v_dual_*): RDNA3 hardware only; an RDNA2 core decoding GFX11 faults on it. */
+   bool has_vopd;
+   /* Do not emit s_delay_alu: an RDNA3 hardware feature. The vendor compiler emits none here. */
+   bool no_delay_alu;
+   /* No v_permlane64_b32 (RDNA3 hardware): on the Xclipse it reads 0, so a wave64 shuffle or
+    * rotate across the two 32-lane halves returned 0 (sgprobe 64; flicker in Eden). Cross-half
+    * wave64 permutes use the per-lane readlane emulation instead. */
+   bool no_permlane64;
+   /* LDS_PARAM_LOAD waits for every outstanding VALU (wait_vdst 0), as the vendor compiler does.
+    * An older VALU write to the load's destination VGPR can land after the load even when the
+    * GFX11 va_vdst count has passed, and the fragment input then reads the stale value
+    * (paulowesll/mesa a0191be5f8: a flat input returned a v_min3_f32 result issued 7 VALUs
+    * earlier). */
+   bool ldsdir_valu_drain;
+   /* Global/scratch immediate offsets are 12-bit signed (-2048..2047) as on RDNA2, although the
+    * GFX11 encoding has a 13-bit field. Measured on the Xclipse 920 (probe/gfx/rt/goffprobe): a
+    * global access at +2800 or +4092 lands 4 KiB low. */
+   bool gfx10_global_offsets;
+   /* Swizzled buffer access without IDXEN, as on GFX10_3, although the ISA is GFX11 (where ACO
+    * sets IDXEN for it). With IDXEN the Xclipse does not add the lane (ADD_TID), so every lane of a
+    * legacy GS wrote lane 0's GSVS slot (transform feedback on the 920). The vendor's GSVS stores
+    * use neither IDXEN nor OFFEN. */
+   bool swizzle_no_idxen;
+   /* Device-scope loads also set DLC. The ISA is GFX11, where GLC alone means device scope, but
+    * the Xclipse caches keep GFX10_3's scopes: GLC alone is shader-array scope, and only GLC + DLC
+    * bypasses GL1. With more than one shader array (940: 2, 950: 4) a wave spinning on another
+    * array's write never saw it (the BVH build hung from 512 triangles on the 950). */
+   bool device_scope_dlc;
+   /* Load FLAT_SCRATCH in the shader from the scratch ring address in s[0:1] and the wave's
+    * scratch offset, as on GFX10.3, although the ISA is GFX11 (where the hardware sets the base
+    * from COMPUTE_DISPATCH_SCRATCH_BASE). The Xclipse's command processor is GFX10.3 and never
+    * does, so without this every scratch access faults until the kernel's 5 s job timeout
+    * (probe/gfx/rt/scratchprobe). */
+   bool gfx10_scratch_init;
    uint32_t address32_hi;
 };
 
