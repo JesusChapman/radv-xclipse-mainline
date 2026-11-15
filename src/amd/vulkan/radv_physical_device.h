@@ -127,6 +127,10 @@ struct radv_physical_device {
    /* Whether to inline the compute dispatch size in user sgprs. */
    bool load_grid_size_from_user_sgpr;
 
+   /* Xclipse: task/mesh draws go through compute dispatches and DRAW_INDIRECT (no firmware
+    * task/mesh packets, no gang submit). */
+   bool xclipse_taskmesh_emul;
+
    /* Number of threads per wave. */
    uint8_t ps_wave_size;
    uint8_t cs_wave_size;
@@ -138,14 +142,40 @@ struct radv_physical_device {
 
    /* Whether to emulate ETC2 image support on HW without support. */
    bool emulate_etc2;
+   /* The texture unit has no BC4/BC5/BC6H/BC7 decoder; decode them on the GPU at upload. */
+   bool emulate_bc;
+   /* Xclipse, on by default: BC5's (and BC4_SNORM's) EAC plane shares plane 0's memory and uploads transcode
+    * straight from the copy's source buffer (radv_image.xclipse_bc_alias). Faster uploads, half the
+    * memory; reads of the image AS BC5 (copies out, uint views) then return EAC data.
+    * RADV_XCLIPSE_BC5_ALIAS=0 or setprop debug.radv_xclipse_bc5_alias 0 turns it off. */
+   bool xclipse_bc5_alias;
+   /* The same for BC7_UNORM / BC7_SRGB and their BC3 carrier: half the memory (a fifth for sRGB on its
+    * old RGBA8 plane). RADV_XCLIPSE_BC7_ALIAS=0 or setprop debug.radv_xclipse_bc7_alias 0 turns it off. */
+   bool xclipse_bc7_alias;
+   /* Xclipse: DCC on colour targets; RADV_XCLIPSE_DCC=0 / debug.radv_xclipse_dcc 0 turns it off. */
+   bool xclipse_dcc;
+   /* Xclipse: DCC also for colour targets of 512x512 and less (debug.radv_xclipse_dcc_small 0 = off). */
+   bool xclipse_dcc_small;
+   /* Xclipse 960: restate the vendor's GL2/LLC cache policy every submit (RADV_XCLIPSE_LLC=1 /
+    * debug.radv_xclipse_llc 1; off by default). */
+   bool xclipse_llc;
 
    /* Whether to emulate ASTC image support on HW without support. */
    bool emulate_astc;
+
+   /* Xclipse: sample ASTC with the hardware decoder (codes: ac_xclipse_astc_img_format). Implies
+    * !emulate_astc. */
+   bool xclipse_native_astc;
+
+   /* Xclipse: same for ETC2/EAC (codes 123..132). Implies !emulate_etc2. */
+   bool xclipse_native_etc2;
 
    VkPhysicalDeviceMemoryProperties memory_properties;
    enum radeon_bo_domain memory_domains[VK_MAX_MEMORY_TYPES];
    enum radeon_bo_flag memory_flags[VK_MAX_MEMORY_TYPES];
    unsigned heaps;
+   /* Index of the synthesized PAL-parity heap, or -1. */
+   int xclipse_pal_heap_index;
 
    /* Bitmask of memory types that use the 32-bit address space. */
    uint32_t memory_types_32bit;
@@ -319,6 +349,16 @@ static inline uint32_t
 radv_get_combined_image_sampler_offset(const struct radv_physical_device *pdev)
 {
    return radv_get_combined_image_sampler_desc_size(pdev) - RADV_SAMPLER_DESC_SIZE;
+}
+
+/* Streamout the GFX11 way (NGG, offsets in the GS registers GDS_STRMOUT_DWORDS_WRITTEN_*, which TITAN
+ * calls SPI_STRMOUT_DWORDS_WRITTEN_*), not GFX10_3's legacy VGT streamout. TITAN (Xclipse 530, 940)
+ * has the GFX11 registers, its vendor driver streams out with ds_ordered_count + ds_add_gs_reg_rtn,
+ * and our legacy (non-NGG) path draws nothing there. */
+static inline bool
+radv_use_gfx11_streamout(const struct radv_physical_device *pdev)
+{
+   return pdev->info.gfx_level >= GFX11 || pdev->info.family == CHIP_TITAN;
 }
 
 #endif /* RADV_PHYSICAL_DEVICE_H */

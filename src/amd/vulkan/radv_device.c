@@ -44,10 +44,13 @@
 #include "util/mesa-blake3.h"
 #include "util/u_atomic.h"
 #include "util/u_process.h"
+
+#include "radv_logcat.h"
 #include "git_sha1.h"
 #include "vk_sync.h"
 
 #include "aco_interface.h"
+#include "radv_xclipse_prof.h"
 
 static bool
 radv_trap_handler_enabled()
@@ -88,12 +91,23 @@ radv_device_init_border_color(struct radv_device *device)
 {
    VkResult result;
 
-   result = radv_bo_create(device, NULL, RADV_BORDER_COLOR_BUFFER_SIZE, 4096, RADEON_DOMAIN_VRAM,
+   /* On GTT-only systems (e.g. VANGOGH_LITE / Xclipse 920) a RADEON_DOMAIN_VRAM border color
+    * palette fails silently (bo NULL, va 0), so use GTT. */
+   uint32_t domain = RADEON_DOMAIN_VRAM;
+   if (!radv_device_physical(device)->info.has_dedicated_vram)
+      domain = RADEON_DOMAIN_GTT;
+
+   RADV_LOGI("[BORDER] has_dedicated_vram=%d domain=%u",
+             (int)radv_device_physical(device)->info.has_dedicated_vram, domain);
+
+   result = radv_bo_create(device, NULL, RADV_BORDER_COLOR_BUFFER_SIZE, 4096, domain,
                            RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_READ_ONLY | RADEON_FLAG_NO_INTERPROCESS_SHARING,
                            RADV_BO_PRIORITY_SHADER, 0, true, &device->border_color_data.bo);
 
    if (result != VK_SUCCESS)
       return vk_error(device, result);
+
+   RADV_LOGI("[BORDER] border_color_data.bo created OK, bo=%p", (void*)device->border_color_data.bo);
 
    radv_rmv_log_border_color_palette_create(device, device->border_color_data.bo);
 
@@ -966,14 +980,19 @@ radv_create_gfx_preamble(struct radv_device *device)
    if (result != VK_SUCCESS)
       return;
 
-   radeon_check_space(device->ws, cs->b, 512);
+   /* 512 covers the stock preamble; Xclipse parts without a kernel clear state add 535 context
+    * registers (radv_queue.c). The BO is sized from the actual cdw below. */
+   radeon_check_space(device->ws, cs->b, 2048);
 
    radv_emit_graphics(device, cs);
 
    device->ws->cs_pad(cs->b, 0);
 
+   /* PREFER_LOCAL -> VM_ALWAYS_VALID: the initial-state preamble is written once and referenced by
+    * every submit. */
    const uint32_t gfx_init_bo_flags = RADEON_FLAG_CPU_ACCESS | RADEON_FLAG_NO_INTERPROCESS_SHARING |
-                                      RADEON_FLAG_READ_ONLY | RADEON_FLAG_GTT_WC | RADEON_FLAG_GL2_BYPASS;
+                                      RADEON_FLAG_READ_ONLY | RADEON_FLAG_GTT_WC | RADEON_FLAG_GL2_BYPASS |
+                                      RADEON_FLAG_PREFER_LOCAL_BO;
 
    result = radv_bo_create(device, NULL, cs->b->cdw * 4, 4096, device->ws->cs_domain(device->ws), gfx_init_bo_flags,
                            RADV_BO_PRIORITY_CS, 0, true, &device->gfx_init);
@@ -1245,6 +1264,10 @@ radv_device_init_compiler_info(struct radv_device *device)
     * feature and have pipelines which may enable smooth lines.
     */
 
+   /* See radeon_info::gfx11_shader_core: the shader core is GFX11 even though gfx_level is
+    * GFX10_3, so the ISA must be compiled as GFX11. */
+   bool gfx11_isa = pdev->info.gfx11_shader_core;
+
    struct radv_compiler_info info = {
       /* Hardware info */
       .ac = &pdev->info.compiler_info,
@@ -1254,6 +1277,9 @@ radv_device_init_compiler_info(struct radv_device *device)
             .instr_prefetch_distance = pdev->info.instr_prefetch_distance,
             .address_prt_wa_control_bit = pdev->info.address_prt_wa_control_bit,
             .rbplus_allowed = pdev->info.rbplus_allowed,
+            .gfx11_isa = gfx11_isa,
+            .hw_scratch_base = pdev->info.family == CHIP_TITAN,
+            .gfx11_ngg = radv_use_gfx11_streamout(pdev),
          },
       /* Misc values included as part of the cache key */
       .key =
@@ -1265,6 +1291,7 @@ radv_device_init_compiler_info(struct radv_device *device)
             .nggc_max_ps_params = nggc_max_ps_params,
             .no_ngg_gs = pdev->drirc.performance.disable_ngg_gs,
             .load_grid_size_from_user_sgpr = pdev->load_grid_size_from_user_sgpr,
+            .xclipse_taskmesh_emul = pdev->xclipse_taskmesh_emul,
             .emulate_ngg_gs_query_pipeline_stat = pdev->emulate_ngg_gs_query_pipeline_stat,
             .primitives_generated_query = primitives_generated_query,
             .mesh_shader_queries = mesh_shader_queries && pdev->emulate_mesh_shader_queries,
@@ -1458,6 +1485,7 @@ radv_create_winsys(struct radv_device *device)
 static void
 radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAllocator)
 {
+   radv_xprof_device_finish(device);
    radv_device_finish_utrace(device);
    radv_device_finish_anti_lag(device);
    radv_device_finish_perf_counter(device);
@@ -1484,6 +1512,9 @@ radv_destroy_device(struct radv_device *device, const VkAllocationCallbacks *pAl
       radv_queue_finish(device->private_sdma_queue);
       vk_free(&device->vk.alloc, device->private_sdma_queue);
    }
+
+   if (device->xclipse_task_bo)
+      radv_bo_destroy(device, NULL, device->xclipse_task_bo);
 
    _mesa_hash_table_destroy(device->rt_handles, NULL);
 
@@ -1568,6 +1599,8 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
       device->memory_types_allowed &= ~pdev->memory_types_device_coherent;
 
    device->vk.command_buffer_ops = &radv_cmd_buffer_ops;
+   /* Samsung sgpu cannot take a foreign sync_file as a submit dependency (see vk_drm_syncobj.c). */
+   device->vk.sync_file_import_cpu_wait = true;
 
    result = radv_device_init_utrace(device);
    if (result != VK_SUCCESS)
@@ -1630,6 +1663,10 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    }
 
    device->vk.sync = device->ws->get_sync_provider(device->ws);
+   if (!device->vk.sync) {
+      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+      goto fail;
+   }
 
    /* Disable unordered submits when SQTT queue events are enabled because queue present events
     * might be missing otherwise.
@@ -1830,6 +1867,8 @@ radv_CreateDevice(VkPhysicalDevice physicalDevice, const VkDeviceCreateInfo *pCr
    }
 
    radv_device_init_rdp(device);
+
+   radv_xprof_device_init(device);
 
    *pDevice = radv_device_to_handle(device);
 
