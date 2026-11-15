@@ -42,8 +42,10 @@
 #include "util/log.h"
 #include "util/os_file.h"
 #include "util/u_gralloc/u_gralloc.h"
+#include "util/u_xclipse_log.h"
 
 #include <hardware/gralloc.h>
+#include <sys/system_properties.h>
 #include <hardware/hardware.h>
 #include <hardware/hwvulkan.h>
 
@@ -141,7 +143,7 @@ static VkResult
 vk_gralloc_to_drm_explicit_layout(
    struct u_gralloc_buffer_handle *in_hnd,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
-   VkSubresourceLayout *out_layouts, int max_planes)
+   VkSubresourceLayout *out_layouts, int max_planes, int *plane_fds)
 {
    struct u_gralloc_buffer_basic_info info;
    struct u_gralloc *u_gralloc = vk_android_get_ugralloc();
@@ -158,8 +160,12 @@ vk_gralloc_to_drm_explicit_layout(
       return VK_ERROR_INVALID_EXTERNAL_HANDLE;
    }
 
+   /* A plane at offset 0 of its own dma-buf (Samsung's NV12M puts Y and CbCr in two) is only
+    * accepted from callers that take the per-plane fds and bind each plane to its own BO. */
    bool is_disjoint = false;
    for (size_t i = 1; i < info.num_planes; i++) {
+      if (plane_fds && info.fds[i] > 0 && info.fds[i] != info.fds[0])
+         continue;
       if (info.offsets[i] == 0) {
          is_disjoint = true;
          mesa_loge("disjoint planes (info.offsets[%zu] == 0) unsupported", i);
@@ -184,6 +190,8 @@ vk_gralloc_to_drm_explicit_layout(
    for (size_t i = 0; i < info.num_planes; i++) {
       out_layouts[i].offset = info.offsets[i];
       out_layouts[i].rowPitch = info.strides[i];
+      if (plane_fds)
+         plane_fds[i] = info.fds[i] > 0 ? info.fds[i] : info.fds[0];
    }
 
    /* Compute arrayPitch for multi-layer buffers. The gralloc HAL does not
@@ -203,10 +211,63 @@ vk_gralloc_to_drm_explicit_layout(
       VkSubresourceLayout tmp = out_layouts[1];
       out_layouts[1] = out_layouts[2];
       out_layouts[2] = tmp;
+      if (plane_fds) {
+         const int fd = plane_fds[1];
+         plane_fds[1] = plane_fds[2];
+         plane_fds[2] = fd;
+      }
    }
 
    return VK_SUCCESS;
 }
+
+/* The dma-buf is not always the handle's first fd: MediaTek's ARM gralloc handle carries three,
+ * the first is -1 and the buffer is the second. The gralloc backend that parsed the handle knows
+ * which, so ask it, and fall back to the largest fd.
+ */
+int
+vk_android_native_handle_dma_buf_fd(const struct native_handle *handle,
+                                    int hal_format, int pixel_stride)
+{
+   assert(handle && handle->numFds > 0);
+   struct u_gralloc *gralloc = vk_android_get_ugralloc();
+   if (gralloc) {
+      struct u_gralloc_buffer_handle gr_handle = {
+         .handle = handle,
+         .hal_format = hal_format,
+         .pixel_stride = pixel_stride,
+      };
+      struct u_gralloc_buffer_basic_info info = {0};
+      if (u_gralloc_get_buffer_basic_info(gralloc, &gr_handle, &info) == 0 &&
+          info.fds[0] > 0)
+         return info.fds[0];
+   }
+   /* No backend parsed it: the largest fd, which on MediaTek is not the first. */
+   int fd = handle->data[0];
+   off_t best = 0;
+   for (int i = 0; i < handle->numFds; i++) {
+      if (handle->data[i] < 0)
+         continue;
+      const off_t sz = lseek(handle->data[i], 0, SEEK_END);
+      lseek(handle->data[i], 0, SEEK_SET);
+      if (sz > best) {
+         best = sz;
+         fd = handle->data[i];
+      }
+   }
+   return fd;
+}
+
+#if ANDROID_API_LEVEL >= 26
+int
+vk_android_ahb_dma_buf_fd(const struct AHardwareBuffer *ahb)
+{
+   AHardwareBuffer_Desc desc;
+   AHardwareBuffer_describe(ahb, &desc);
+   return vk_android_native_handle_dma_buf_fd(
+      AHardwareBuffer_getNativeHandle(ahb), desc.format, desc.stride);
+}
+#endif
 
 VkResult
 vk_android_import_anb_memory(struct vk_device *device,
@@ -216,7 +277,8 @@ vk_android_import_anb_memory(struct vk_device *device,
 {
    assert(anb && anb->handle && anb->handle->numFds > 0);
 
-   int dma_buf_fd = anb->handle->data[0];
+   int dma_buf_fd =
+      vk_android_native_handle_dma_buf_fd(anb->handle, anb->format, anb->stride);
 
    /* Query image memory requirements for size and supported memory types */
    VkMemoryRequirements mem_reqs;
@@ -318,7 +380,7 @@ vk_android_get_anb_layout(
    };
 
    return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+                                            out_layouts, max_planes, NULL);
 }
 
 VkResult
@@ -431,6 +493,31 @@ vk_android_init_deferred_image(struct vk_device *device,
    return VK_SUCCESS;
 }
 
+/* Xclipse (ro.hardware.vulkan = samsung): Samsung's gralloc gives a buffer whose usage is GPU-only
+ * a compressed, tiled layout (handle data[38] = 2) that only the vendor driver understands. What we
+ * write there reads back black to every other user, and what they write reads back as garbage to
+ * us (probe/gfx/ahbx on the 530 and 940; the 920 does it for composer buffers). One CPU usage bit
+ * makes gralloc allocate it linear. Applied to swapchain images and to AHBs we allocate. Default on;
+ * MESA_GRALLOC_LINEAR=0 / setprop debug.mesa_gralloc_linear 0 turns it off. */
+static bool
+vk_android_gralloc_linear(void)
+{
+   static int v = -1;
+   if (v < 0) {
+      char p[PROP_VALUE_MAX] = {0};
+      int on = __system_property_get("ro.hardware.vulkan", p) > 0 && !strcmp(p, "samsung");
+      const char *e = getenv("MESA_GRALLOC_LINEAR");
+      if (e && e[0])
+         on = e[0] != '0';
+      else if (__system_property_get("debug.mesa_gralloc_linear", p) > 0 && p[0])
+         on = p[0] != '0';
+      v = on;
+      if (on && u_xclipse_log_on())
+         mesa_logi("Samsung gralloc: swapchain and exported buffers get CPU usage (linear layout)");
+   }
+   return v;
+}
+
 static VkResult
 setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
                      int *out_gralloc_usage)
@@ -452,6 +539,9 @@ setup_gralloc0_usage(VkFormat format, VkImageUsageFlags image_usage,
 
    if (!gralloc_usage)
       return VK_ERROR_FORMAT_NOT_SUPPORTED;
+
+   if (vk_android_gralloc_linear())
+      gralloc_usage |= GRALLOC_USAGE_SW_READ_RARELY | GRALLOC_USAGE_SW_WRITE_RARELY;
 
    *out_gralloc_usage = gralloc_usage;
 
@@ -663,6 +753,12 @@ vk_common_GetSwapchainGrallocUsage2ANDROID(
    if (swapchainImageUsage & VK_SWAPCHAIN_IMAGE_USAGE_SHARED_BIT_ANDROID)
       *grallocProducerUsage |= vk_android_get_front_buffer_usage();
 
+   /* Linear on Samsung gralloc, see vk_android_gralloc_linear(). */
+   if (gralloc_usage & GRALLOC_USAGE_SW_READ_RARELY)
+      *grallocConsumerUsage |= GRALLOC1_CONSUMER_USAGE_CPU_READ;
+   if (gralloc_usage & GRALLOC_USAGE_SW_WRITE_RARELY)
+      *grallocProducerUsage |= GRALLOC1_PRODUCER_USAGE_CPU_WRITE;
+
    return VK_SUCCESS;
 }
 
@@ -671,6 +767,16 @@ vk_android_get_ahb_layout(
    struct AHardwareBuffer *ahardware_buffer,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
+{
+   return vk_android_get_ahb_layout_fds(ahardware_buffer, out, out_layouts,
+                                        max_planes, NULL);
+}
+
+VkResult
+vk_android_get_ahb_layout_fds(
+   struct AHardwareBuffer *ahardware_buffer,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts, int max_planes, int *plane_fds)
 {
    AHardwareBuffer_Desc description;
    const native_handle_t *handle =
@@ -685,7 +791,7 @@ vk_android_get_ahb_layout(
    };
 
    return vk_gralloc_to_drm_explicit_layout(&gr_handle, out,
-                                            out_layouts, max_planes);
+                                            out_layouts, max_planes, plane_fds);
 }
 
 /* From the Android hardware_buffer.h header:
@@ -856,6 +962,10 @@ vk_image_usage_to_ahb_usage(const VkImageCreateFlags2KHR vk_create,
    if (ahb_usage == 0)
       ahb_usage = AHARDWAREBUFFER_USAGE_GPU_SAMPLED_IMAGE;
 
+   /* Linear on Samsung gralloc, see vk_android_gralloc_linear(). */
+   if (vk_android_gralloc_linear())
+      ahb_usage |= AHARDWAREBUFFER_USAGE_CPU_READ_RARELY | AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
+
    return ahb_usage;
 }
 
@@ -1001,6 +1111,8 @@ vk_alloc_ahardware_buffer(const VkMemoryAllocateInfo *pAllocateInfo)
              !vk_format_is_depth_or_stencil(image->format))
             usage |= AHARDWAREBUFFER_USAGE_CPU_WRITE_RARELY;
       }
+      /* The driver may need extra gralloc usage bits for its own layouts (PanVK, Mali). */
+      usage |= image->base.device->physical->android_ahb_image_usage;
    } else {
       /* AHB export allocation for VkBuffer requires a valid allocationSize */
       assert(pAllocateInfo->allocationSize);
@@ -1078,6 +1190,22 @@ get_ahb_buffer_format_properties2(
    VkFormatProperties2 format_properties = {.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2};
 
    p->format = vk_ahb_format_to_image_format(desc.format);
+
+   /* An allocator may store a BGRA buffer as RGBA: MediaTek's ARM gralloc does for GPU-only
+    * (AFBC) buffers, where only the component order in the descriptor tells them apart. Report
+    * the format the buffer is stored in, as the vendor driver there does. */
+   if (p->format == VK_FORMAT_B8G8R8A8_UNORM && vk_android_get_ugralloc()) {
+      struct u_gralloc_buffer_handle bgra_handle = {
+         .handle = AHardwareBuffer_getNativeHandle(buffer),
+         .pixel_stride = desc.stride,
+         .hal_format = desc.format,
+      };
+      struct u_gralloc_buffer_basic_info bgra_info = {0};
+      if (u_gralloc_get_buffer_basic_info(vk_android_get_ugralloc(), &bgra_handle,
+                                          &bgra_info) == 0 &&
+          bgra_info.drm_fourcc == DRM_FORMAT_ABGR8888)
+         p->format = VK_FORMAT_R8G8B8A8_UNORM;
+   }
 
    VkFormat external_format = p->format;
 
@@ -1257,15 +1385,14 @@ vk_common_GetAndroidHardwareBufferPropertiesANDROID(
       }
    }
 
-   const native_handle_t *handle = AHardwareBuffer_getNativeHandle(buffer);
-   assert(handle && handle->numFds > 0);
-   pProperties->allocationSize = lseek(handle->data[0], 0, SEEK_END);
+   const int dma_buf_fd = vk_android_ahb_dma_buf_fd(buffer);
+   pProperties->allocationSize = lseek(dma_buf_fd, 0, SEEK_END);
 
    VkMemoryFdPropertiesKHR fd_props = {
       .sType = VK_STRUCTURE_TYPE_MEMORY_FD_PROPERTIES_KHR,
    };
    result = device->dispatch_table.GetMemoryFdPropertiesKHR(
-      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, handle->data[0],
+      device_h, VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT, dma_buf_fd,
       &fd_props);
    if (result != VK_SUCCESS)
       return result;
@@ -1322,7 +1449,8 @@ vk_android_get_ahb_image_properties(
                        "format (%u) unsupported for AHB", info->format);
    }
 
-   const uint64_t ahb_usage = vk_image_format_info_to_ahb_usage(info);
+   const uint64_t ahb_usage =
+      vk_image_format_info_to_ahb_usage(info) | pdevice->android_ahb_image_usage;
    if (!vk_ahb_probe_format(ahb_format, ahb_usage)) {
       return vk_errorf(pdevice, VK_ERROR_FORMAT_NOT_SUPPORTED,
                        "ahb_format (%u) ahb_usage (0x%" PRIx64 ") unsupported",

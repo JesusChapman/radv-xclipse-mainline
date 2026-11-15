@@ -43,6 +43,15 @@ struct vk_image;
 
 struct u_gralloc *vk_android_get_ugralloc(void);
 
+struct native_handle;
+int vk_android_native_handle_dma_buf_fd(const struct native_handle *handle,
+                                        int hal_format, int pixel_stride);
+
+#if ANDROID_API_LEVEL >= 26
+struct AHardwareBuffer;
+int vk_android_ahb_dma_buf_fd(const struct AHardwareBuffer *ahb);
+#endif
+
 VkResult vk_android_import_anb(struct vk_device *device,
                                const VkImageCreateInfo *pCreateInfo,
                                const VkAllocationCallbacks *alloc,
@@ -122,6 +131,13 @@ VkResult vk_android_get_ahb_layout(
    struct AHardwareBuffer *ahardware_buffer,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes);
+
+/* As vk_android_get_ahb_layout(), and also accepts planes in separate dma-bufs: plane_fds[i] is
+ * the dma-buf holding plane i, whose layout offset is then relative to that fd. */
+VkResult vk_android_get_ahb_layout_fds(
+   struct AHardwareBuffer *ahardware_buffer,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts, int max_planes, int *plane_fds);
 
 VkResult vk_android_get_ahb_image_properties(
    VkPhysicalDevice pdev_handle,
@@ -219,6 +235,15 @@ vk_android_get_ahb_layout(
    struct AHardwareBuffer *ahardware_buffer,
    VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
    VkSubresourceLayout *out_layouts, int max_planes)
+{
+   return VK_ERROR_FEATURE_NOT_PRESENT;
+}
+
+static inline VkResult
+vk_android_get_ahb_layout_fds(
+   struct AHardwareBuffer *ahardware_buffer,
+   VkImageDrmFormatModifierExplicitCreateInfoEXT *out,
+   VkSubresourceLayout *out_layouts, int max_planes, int *plane_fds)
 {
    return VK_ERROR_FEATURE_NOT_PRESENT;
 }
