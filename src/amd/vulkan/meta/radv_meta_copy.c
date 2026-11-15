@@ -9,6 +9,8 @@
 #include "radv_sdma.h"
 #include "vk_format.h"
 
+#include "radv_logcat.h"
+
 VkFormat
 vk_format_for_size(int bs)
 {
@@ -321,8 +323,19 @@ gfx_or_compute_copy_memory_to_image(struct radv_cmd_buffer *cmd_buffer, VkAddres
 
    /* The Vulkan 1.0 spec says "dstImage must have a sample count equal to
     * VK_SAMPLE_COUNT_1_BIT."
-    */
-   assert(image->vk.samples == 1);
+    *
+    * Eden (Pokemon Brilliant Diamond) violates this with memory->image copies into MSAA images.
+    * Match release behaviour (copy best-effort, sample 0): warn and proceed instead of asserting.
+     */
+   if (unlikely(image->vk.samples != 1)) {
+      static bool warned = false;
+      if (!warned) {
+         mesa_loge("radv: memory<->image copy on a %u-sample image (app spec violation); "
+                   "performing best-effort copy instead of aborting",
+                   image->vk.samples);
+         warned = true;
+      }
+   }
 
    /**
     * From the Vulkan 1.0.6 spec: 18.3 Copying Data Between Images
@@ -442,6 +455,14 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
 
    radv_cs_add_buffer(device->ws, cs->b, src_buffer->bo);
 
+   /* This command reads a buffer, never a decoded plane 1, so it does not consume decode output:
+    * don't drain the deferred decode flush. Only on buffer/memory -> image paths; image -> image
+    * copies from an emulated image do read plane 1. */
+   const bool bc_defer_window = radv_is_format_emulated(pdev, dst_image->vk.format) &&
+                                cmd_buffer->qf != RADV_QUEUE_TRANSFER;
+   if (bc_defer_window)
+      cmd_buffer->state.bc_decode_active++;
+
    for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
       const VkBufferImageCopy2 *region = &pCopyBufferToImageInfo->pRegions[r];
       const VkImageAspectFlags aspect_mask = region->imageSubresource.aspectMask;
@@ -460,7 +481,14 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
          .imageExtent = region->imageExtent,
       };
 
+      /* Aliased BC4S/BC5/BC7: nothing to copy, the transcode below reads the buffer and writes the carrier. */
+      if (dst_image->xclipse_bc_alias && cmd_buffer->qf != RADV_QUEUE_TRANSFER)
+         continue;
+
       if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
+         RADV_LOGI("[COPY_BUF2IMG] route=SDMA qf=%u fmt=%u extent=%ux%ux%u",
+                   cmd_buffer->qf, dst_image->vk.format,
+                   region->imageExtent.width, region->imageExtent.height, region->imageExtent.depth);
          transfer_copy_memory_image(cmd_buffer, src_copy_flags, dst_image, &copy, true);
       } else {
          const bool use_compute =
@@ -468,24 +496,45 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
             ((pdev->drirc.performance.image_meta_path == RADV_IMAGE_META_PATH_COMPUTE ||
               pdev->drirc.performance.image_meta_path == RADV_IMAGE_META_PATH_FAST_CLEAR_ELSE_COMPUTE) &&
              !vk_format_is_depth_or_stencil(dst_image->vk.format));
+         RADV_LOGI("[COPY_BUF2IMG] route=%s qf=%u fmt=%u extent=%ux%ux%u",
+                   use_compute ? "COMPUTE" : "GFX", cmd_buffer->qf, dst_image->vk.format,
+                   region->imageExtent.width, region->imageExtent.height, region->imageExtent.depth);
          gfx_or_compute_copy_memory_to_image(cmd_buffer, src_copy_flags, dst_image, &copy, use_compute);
       }
    }
 
    if (radv_is_format_emulated(pdev, dst_image->vk.format) && cmd_buffer->qf != RADV_QUEUE_TRANSFER) {
-      cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_SYNC_PS |
-                                      radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                                            VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, dst_image, NULL) |
-                                      radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
-                                                            VK_ACCESS_2_TRANSFER_READ_BIT, 0, dst_image, NULL);
+      /* Orders our copy into plane 0 before the decode reads it. The aliased path copies nothing. */
+      if (!dst_image->xclipse_bc_alias)
+         cmd_buffer->state.flush_bits |= AC_BARRIER_SYNC_CS | AC_BARRIER_SYNC_PS |
+                                         radv_src_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                               VK_ACCESS_2_TRANSFER_WRITE_BIT, 0, dst_image, NULL) |
+                                         radv_dst_access_flush(cmd_buffer, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+                                                               VK_ACCESS_2_TRANSFER_READ_BIT, 0, dst_image, NULL);
 
       const enum util_format_layout format_layout = radv_format_description(dst_image->vk.format)->layout;
       for (unsigned r = 0; r < pCopyBufferToImageInfo->regionCount; r++) {
+         if (dst_image->xclipse_bc_alias) {
+            const VkBufferImageCopy2 *region = &pCopyBufferToImageInfo->pRegions[r];
+            const VkExtent3D ext = vk_image_sanitize_extent(&dst_image->vk, region->imageExtent);
+            radv_meta_decode_bc_from_buffer(
+               cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout, &region->imageSubresource,
+               region->imageOffset, region->imageExtent,
+               vk_device_address_range(&src_buffer->vk, region->bufferOffset, VK_WHOLE_SIZE).address,
+               region->bufferRowLength ? region->bufferRowLength : ext.width,
+               region->bufferImageHeight ? region->bufferImageHeight : ext.height);
+            continue;
+         }
          if (format_layout == UTIL_FORMAT_LAYOUT_ASTC) {
             radv_meta_decode_astc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
                                   &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
                                   pCopyBufferToImageInfo->pRegions[r].imageOffset,
                                   pCopyBufferToImageInfo->pRegions[r].imageExtent);
+         } else if (radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED) {
+            radv_meta_decode_bc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
+                                &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
+                                pCopyBufferToImageInfo->pRegions[r].imageOffset,
+                                pCopyBufferToImageInfo->pRegions[r].imageExtent);
          } else {
             radv_meta_decode_etc(cmd_buffer, dst_image, pCopyBufferToImageInfo->dstImageLayout,
                                  &pCopyBufferToImageInfo->pRegions[r].imageSubresource,
@@ -493,7 +542,15 @@ radv_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer, const VkCopyBufferToIm
                                  pCopyBufferToImageInfo->pRegions[r].imageExtent);
          }
       }
+
+      /* Once for the whole run of decodes, not once per region. */
+      if (format_layout != UTIL_FORMAT_LAYOUT_ASTC && radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED)
+         radv_meta_decode_bc_flush(cmd_buffer, dst_image, pCopyBufferToImageInfo->regionCount);
    }
+
+   /* Close the window opened before the region loop; later commands drain normally. */
+   if (bc_defer_window)
+      cmd_buffer->state.bc_decode_active--;
 
    radv_meta_end(cmd_buffer);
 
@@ -548,10 +605,18 @@ radv_CmdCopyMemoryToImageKHR(VkCommandBuffer commandBuffer, const VkCopyDeviceMe
             radv_meta_decode_astc(cmd_buffer, dst_image, region->imageLayout, &region->imageSubresource,
                                   region->imageOffset, region->imageExtent);
          } else {
-            radv_meta_decode_etc(cmd_buffer, dst_image, region->imageLayout, &region->imageSubresource,
-                                 region->imageOffset, region->imageExtent);
+            if (radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED)
+               radv_meta_decode_bc(cmd_buffer, dst_image, region->imageLayout, &region->imageSubresource,
+                                   region->imageOffset, region->imageExtent);
+            else
+               radv_meta_decode_etc(cmd_buffer, dst_image, region->imageLayout, &region->imageSubresource,
+                                    region->imageOffset, region->imageExtent);
          }
       }
+
+      /* Once for the whole run of decodes, not once per region. */
+      if (format_layout != UTIL_FORMAT_LAYOUT_ASTC && radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED)
+         radv_meta_decode_bc_flush(cmd_buffer, dst_image, pCopyMemoryInfo->regionCount);
    }
 
    radv_meta_end(cmd_buffer);
@@ -680,8 +745,14 @@ radv_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer, const VkCopyImageToBuf
       };
 
       if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
+         RADV_LOGI("[COPY_IMG2BUF] route=SDMA qf=%u fmt=%u extent=%ux%ux%u",
+                   cmd_buffer->qf, src_image->vk.format,
+                   region->imageExtent.width, region->imageExtent.height, region->imageExtent.depth);
          transfer_copy_memory_image(cmd_buffer, dst_copy_flags, src_image, &copy, false);
       } else {
+         RADV_LOGI("[COPY_IMG2BUF] route=COMPUTE qf=%u fmt=%u extent=%ux%ux%u",
+                   cmd_buffer->qf, src_image->vk.format,
+                   region->imageExtent.width, region->imageExtent.height, region->imageExtent.depth);
          compute_copy_image_to_memory(cmd_buffer, dst_copy_flags, src_image, &copy);
       }
    }
@@ -1003,6 +1074,9 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
       radv_cs_add_buffer(device->ws, cs->b, dst_image->bindings[dst_bind_idx].bo);
 
       if (cmd_buffer->qf == RADV_QUEUE_TRANSFER) {
+         RADV_LOGI("[COPY_IMG2IMG] route=SDMA qf=%u src_fmt=%u dst_fmt=%u extent=%ux%ux%u",
+                   cmd_buffer->qf, src_image->vk.format, dst_image->vk.format,
+                   region->extent.width, region->extent.height, region->extent.depth);
          transfer_copy_image(cmd_buffer, src_image, pCopyImageInfo->srcImageLayout, dst_image,
                              pCopyImageInfo->dstImageLayout, region);
       } else {
@@ -1014,6 +1088,9 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
              radv_layout_fmask_compression(device, dst_image, pCopyImageInfo->dstImageLayout,
                                            radv_image_queue_family_mask(dst_image, cmd_buffer->qf)) ==
                 RADV_FMASK_COMPRESSION_NONE);
+         RADV_LOGI("[COPY_IMG2IMG] route=%s qf=%u src_fmt=%u dst_fmt=%u extent=%ux%ux%u",
+                   use_compute ? "COMPUTE" : "GFX", cmd_buffer->qf, src_image->vk.format, dst_image->vk.format,
+                   region->extent.width, region->extent.height, region->extent.depth);
          gfx_or_compute_copy_image(cmd_buffer, src_image, pCopyImageInfo->srcImageLayout, dst_image,
                                    pCopyImageInfo->dstImageLayout, region, use_compute);
       }
@@ -1047,11 +1124,25 @@ radv_CmdCopyImage2(VkCommandBuffer commandBuffer, const VkCopyImageInfo2 *pCopyI
                                   &pCopyImageInfo->pRegions[r].dstSubresource, pCopyImageInfo->pRegions[r].dstOffset,
                                   dst_extent);
          } else {
-            radv_meta_decode_etc(cmd_buffer, dst_image, pCopyImageInfo->dstImageLayout,
-                                 &pCopyImageInfo->pRegions[r].dstSubresource, pCopyImageInfo->pRegions[r].dstOffset,
-                                 dst_extent);
+            if (radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED) {
+               /* Aliased to aliased (BC4S, BC5, BC7): plane 0 already held the carrier and was copied as it
+                * is; a decode would read it as the source format. The extent is the destination's, in
+                * texels: from an uncompressed source (a GPU BC encoder's uint image, one texel per
+                * block) the region counts blocks, and passing it as is decoded 1/16 of the area. */
+               if (!(dst_image->xclipse_bc_alias && src_image->xclipse_bc_alias))
+                  radv_meta_decode_bc(cmd_buffer, dst_image, pCopyImageInfo->dstImageLayout,
+                                      &pCopyImageInfo->pRegions[r].dstSubresource,
+                                      pCopyImageInfo->pRegions[r].dstOffset, dst_extent);
+            } else
+               radv_meta_decode_etc(cmd_buffer, dst_image, pCopyImageInfo->dstImageLayout,
+                                    &pCopyImageInfo->pRegions[r].dstSubresource, pCopyImageInfo->pRegions[r].dstOffset,
+                                    dst_extent);
          }
       }
+
+      /* Once for the whole run of decodes, not once per region. */
+      if (format_layout != UTIL_FORMAT_LAYOUT_ASTC && radv_bc_emulation_format(dst_image->vk.format) != VK_FORMAT_UNDEFINED)
+         radv_meta_decode_bc_flush(cmd_buffer, dst_image, pCopyImageInfo->regionCount);
    }
 
    radv_meta_end(cmd_buffer);
