@@ -208,25 +208,37 @@ vk_drm_syncobj_reset_many(struct vk_device *device,
    return VK_SUCCESS;
 }
 
+/* Wait until the syncobj has a fence -- not until it signals.
+ *
+ * On the binary wait ioctl WAIT_FOR_SUBMIT alone also waits for the fence to SIGNAL, so using it
+ * as a materialization check made every sync file export (one per present) wait for the GPU to
+ * finish. WAIT_AVAILABLE returns once the fence exists, and only the timeline ioctl takes it
+ * (point 0 is the binary payload). Kernels without it fall back to the full wait. */
+static int
+syncobj_wait_materialized(struct vk_device *device, uint32_t *handle, uint64_t abs_timeout_ns)
+{
+   if (device->sync->timeline_wait) {
+      uint64_t point = 0;
+      errno = 0;
+      int err = device->sync->timeline_wait(device->sync, handle, &point, 1, abs_timeout_ns,
+                                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT |
+                                               DRM_SYNCOBJ_WAIT_FLAGS_WAIT_AVAILABLE,
+                                            NULL /* first_signaled */);
+      if (err != -EINVAL && err != -EOPNOTSUPP && errno != EINVAL && errno != EOPNOTSUPP)
+         return err;
+   }
+   return device->sync->wait(device->sync, handle, 1, abs_timeout_ns,
+                             DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT, NULL /* first_signaled */);
+}
+
 static VkResult
 sync_has_sync_file(struct vk_device *device, struct vk_sync *sync)
 {
    uint32_t handle = to_drm_syncobj(sync)->syncobj;
 
-   int fd = -1;
-   int err = device->sync->export_sync_file(device->sync, handle, &fd);
-   if (!err) {
-      close(fd);
-      return VK_SUCCESS;
-   }
-
-   /* On the off chance the sync_file export repeatedly fails for some
-    * unexpected reason, we want to ensure this function will return success
-    * eventually.  Do a zero-time syncobj wait if the export failed.
-    */
-   err = device->sync->wait(device->sync, &handle, 1, 0 /* timeout */,
-                            DRM_SYNCOBJ_WAIT_FLAGS_WAIT_FOR_SUBMIT,
-                            NULL /* first_signaled */);
+   /* Xclipse 920 (Samsung sgpu): exporting a sync file from an unmaterialized syncobj hard-locks
+    * the kernel, so probe materialization with a zero-time wait instead. */
+   int err = syncobj_wait_materialized(device, &handle, 0 /* timeout */);
    if (!err) {
       return VK_SUCCESS;
    } else if (errno == ETIME) {
@@ -408,6 +420,13 @@ vk_drm_syncobj_import_sync_file(struct vk_device *device,
 {
    struct vk_drm_syncobj *sobj = to_drm_syncobj(sync);
 
+   /* Xclipse 920 (Samsung sgpu): foreign dma_fences imported as submit dependencies can lock up the
+    * kernel at first present. CPU-wait the sync_file before importing (up to 3 s); on timeout
+    * import anyway. Only where the driver asks for it: on the Mali kbase path this made the
+    * present of every frame wait for the GPU to finish it (see vk_device::sync_file_import_cpu_wait). */
+   if (sync_file >= 0 && device->sync_file_import_cpu_wait)
+      sync_wait(sync_file, 3000 /* ms */);
+
    int err = device->sync->import_sync_file(device->sync, sobj->syncobj, sync_file);
    if (err) {
       return vk_errorf(device, VK_ERROR_UNKNOWN,
@@ -423,6 +442,19 @@ vk_drm_syncobj_export_sync_file(struct vk_device *device,
                                 int *sync_file)
 {
    struct vk_drm_syncobj *sobj = to_drm_syncobj(sync);
+
+   /* Xclipse 920 (Samsung sgpu): exporting a sync file from a syncobj whose fence is not yet
+    * materialized crashes the kernel (whole phone). Wait for materialization before exporting; on
+    * timeout fail the export instead of exporting anyway. */
+   {
+      uint64_t abs_timeout_ns = os_time_get_absolute_timeout(5ull * 1000 * 1000 * 1000 /* 5s */);
+      int werr = syncobj_wait_materialized(device, &sobj->syncobj, abs_timeout_ns);
+      if (werr) {
+         return vk_errorf(device, VK_ERROR_UNKNOWN,
+                          "sync_file export refused: fence not materialized after 5s "
+                          "(exporting would hard-lock the sgpu kernel)");
+      }
+   }
 
    int err = device->sync->export_sync_file(device->sync, sobj->syncobj, sync_file);
    if (err) {
@@ -658,6 +690,9 @@ vk_drm_syncobj_copy_payloads(struct vk_device *device,
 struct vk_sync_type
 vk_drm_syncobj_get_type_from_provider(struct util_sync_provider *sync)
 {
+   if (!sync)
+      return (struct vk_sync_type) { .features = 0 };
+
    uint32_t syncobj = 0;
    int err = sync->create(sync, DRM_SYNCOBJ_CREATE_SIGNALED, &syncobj);
    if (err < 0)
@@ -708,6 +743,8 @@ struct vk_sync_type
 vk_drm_syncobj_get_type(int drm_fd)
 {
    struct util_sync_provider *sync = util_sync_provider_drm(drm_fd);
+   if (!sync)
+      return (struct vk_sync_type) { .features = 0 };
    struct vk_sync_type ret = vk_drm_syncobj_get_type_from_provider(sync);
    sync->finalize(sync);
    return ret;

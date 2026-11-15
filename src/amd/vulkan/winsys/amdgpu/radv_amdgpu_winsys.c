@@ -165,11 +165,21 @@ radv_amdgpu_winsys_destroy(struct radeon_winsys *rws)
 {
    struct radv_amdgpu_winsys *ws = (struct radv_amdgpu_winsys *)rws;
 
+   /* Nothing freed below may park in the IB cache, and what this winsys parked goes now
+    * (radv_xclipse_ibcache_purge_ws()). */
+   radv_xclipse_ibcache_winsys_begin_destroy(ws);
+
    if (ws->info.compiler_info.has_smem_with_null_prt_bug) {
       simple_mtx_destroy(&ws->null_prt_bug.lock);
       if (ws->null_prt_bug.bo)
          ws->base.buffer_destroy(&ws->base, ws->null_prt_bug.bo);
    }
+
+   /* Release IB BOs still parked in the cache. */
+   for (uint32_t i = 0; i < ws->ib_cache.count; i++)
+      ws->base.buffer_destroy(&ws->base, ws->ib_cache.entries[i].bo);
+   ws->ib_cache.count = 0;
+   simple_mtx_destroy(&ws->ib_cache.lock);
 
    u_rwlock_destroy(&ws->global_bo_list.lock);
    free(ws->global_bo_list.bos);
@@ -181,6 +191,8 @@ radv_amdgpu_winsys_destroy(struct radeon_winsys *rws)
       fclose(ws->bo_history_logfile);
 
    u_rwlock_destroy(&ws->log_bo_list_lock);
+
+   radv_xclipse_ibcache_winsys_end_destroy(ws);
 
    radv_amdgpu_alloc_tracker_release(ws->alloc_tracker);
 
@@ -228,6 +240,8 @@ radv_amdgpu_winsys_create(int fd, const struct radeon_info *info, const struct r
    ac_drm_device *dev;
    struct radv_amdgpu_winsys *ws = NULL;
 
+   *winsys = NULL;
+
    r = ac_drm_device_initialize(fd, options->is_virtio, &drm_major, &drm_minor, &dev);
    if (r) {
       fprintf(stderr, "radv/amdgpu: failed to initialize device.\n");
@@ -262,8 +276,10 @@ radv_amdgpu_winsys_create(int fd, const struct radeon_info *info, const struct r
          fprintf(stderr, "radv/amdgpu: Failed to create /tmp/radv_bo_history.log.\n");
    }
 
-   if (ac_drm_cs_create_syncobj2(ws->dev, 0, &ws->vm_timeline_syncobj))
+   if (ac_drm_cs_create_syncobj2(ws->dev, 0, &ws->vm_timeline_syncobj)) {
+      result = VK_ERROR_INITIALIZATION_FAILED;
       goto winsys_fail;
+   }
 
    simple_mtx_init(&ws->vm_ioctl_lock, mtx_plain);
 
@@ -289,11 +305,16 @@ radv_amdgpu_winsys_create(int fd, const struct radeon_info *info, const struct r
    if (ws->info.compiler_info.has_smem_with_null_prt_bug)
       simple_mtx_init(&ws->null_prt_bug.lock, mtx_plain);
 
+   /* Command-buffer IB cache (see radv_amdgpu_winsys.h). */
+   simple_mtx_init(&ws->ib_cache.lock, mtx_plain);
+
    *winsys = &ws->base;
 
    return result;
 
 winsys_fail:
+   if (ws->bo_history_logfile)
+      fclose(ws->bo_history_logfile);
    if (ws->alloc_tracker)
       radv_amdgpu_alloc_tracker_release(ws->alloc_tracker);
    free(ws);
@@ -360,6 +381,10 @@ radv_amdgpu_winsys_query_info(int fd, bool is_virtio, bool cache_compat, struct 
    info->base.ip[AMD_IP_COMPUTE].num_queues = MIN2(info->base.ip[AMD_IP_COMPUTE].num_queues, MAX_RINGS_PER_TYPE);
 
    info->syncobj_sync_type = vk_drm_syncobj_get_type(fd);
+   if (!info->syncobj_sync_type.features) {
+      result = VK_ERROR_INITIALIZATION_FAILED;
+      goto fail;
+   }
 
    /* Determine which context priorities are supported. */
    for (uint32_t p = RADEON_CTX_PRIORITY_LOW; p <= RADEON_CTX_PRIORITY_REALTIME; p++) {
