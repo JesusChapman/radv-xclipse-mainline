@@ -5,6 +5,7 @@
  */
 
 #include "ac_gpu_info.h"
+#include "ac_xclipse_log.h"
 #include "ac_shader_util.h"
 #include "ac_debug.h"
 #include "ac_surface.h"
@@ -13,7 +14,164 @@
 
 #include "addrlib/src/amdgpu_asic_addr.h"
 #include "amd_family.h"
+
+#include "radv_logcat.h"
+#include <android/log.h>
 #include "amdgfxregs.h"
+#include "ac_titan_regmap.h"
+
+/* TITAN's register remap is a global: __ac_cmdbuf_set_reg_seq() has no device pointer.
+ * See ac_titan_regmap.h. */
+bool ac_titan_regmap_active = false;
+uint32_t ac_titan_regmap_level = 0;
+bool ac_titan_regmap_suppress = true;
+bool ac_titan_sh_cu_masks = false;
+int ac_titan_cb_ext_slot = -1;
+int ac_titan_cb_view_slot = -1;
+uint32_t ac_titan_regmap_hits = 0;
+
+#define AC_TITAN_CTX_DWORDS ((SI_CONTEXT_REG_END - SI_CONTEXT_REG_OFFSET) / 4)
+#define AC_TITAN_SH_DWORDS  ((SI_SH_REG_END - SI_SH_REG_OFFSET) / 4)
+
+/* Two kinds of collision:
+ *   MOVED x MOVED    two entries land on the same destination: a table bug, fatal.
+ *   MOVED x IDENTITY an entry lands on a slot the table leaves alone: a clobber only if the
+ *                    driver writes that slot. Warn with the offset; check against an IB dump.
+ * (PA_SU_SC_MODE_CNTL 0x205 -> 0x204 was the second kind and destroyed PA_CL_CLIP_CNTL.) */
+static bool
+ac_titan_check_space(const char *space, uint32_t n, uint32_t (*remap)(uint32_t),
+                     uint16_t *src_of, uint32_t *n_moved, uint32_t *n_warn)
+{
+   bool fatal = false;
+
+   memset(src_of, 0, n * sizeof(*src_of));
+   *n_moved = 0;
+   *n_warn = 0;
+
+   for (uint32_t dw = 0; dw < n; dw++) {
+      const uint32_t to = remap(dw);
+
+      if (to >= n) {
+         RADV_LOGI("[XCLIPSE] TITAN regmap BAD: %s 0x%03x -> 0x%03x is outside the space",
+                   space, dw, to);
+         fatal = true;
+         continue;
+      }
+      if (to != dw)
+         (*n_moved)++;
+
+      if (src_of[to]) {
+         const uint32_t other = src_of[to] - 1;
+         const bool both_moved = (remap(other) != other) && (to != dw);
+
+         if (both_moved) {
+            RADV_LOGI("[XCLIPSE] TITAN regmap COLLISION (FATAL): %s 0x%03x and 0x%03x are "
+                      "both remapped onto 0x%03x", space, other, dw, to);
+            fatal = true;
+         } else {
+            (*n_warn)++;
+            RADV_LOGI("[XCLIPSE] TITAN regmap lands on an unmapped slot: %s 0x%03x -> 0x%03x, "
+                      "shared with 0x%03x. Clobbers ONLY if the driver writes 0x%03x -- check "
+                      "an IB dump.",
+                      space, (to != dw) ? dw : other, to, (to != dw) ? other : dw, to);
+         }
+      } else {
+         src_of[to] = dw + 1;
+      }
+   }
+   return !fatal;
+}
+
+bool
+ac_titan_regmap_validate(void)
+{
+   /* Static rather than stack: 16 KB, and this runs once at device init. */
+   static uint16_t src_of[AC_TITAN_CTX_DWORDS];
+   uint32_t moved_ctx = 0, moved_sh = 0, warn_ctx = 0, warn_sh = 0;
+   bool ok = true;
+
+   ok &= ac_titan_check_space("ctx", AC_TITAN_CTX_DWORDS, ac_titan_ctx_dw, src_of,
+                              &moved_ctx, &warn_ctx);
+   ok &= ac_titan_check_space("sh", AC_TITAN_SH_DWORDS, ac_titan_sh_dw, src_of,
+                              &moved_sh, &warn_sh);
+
+   RADV_LOGI("[XCLIPSE] TITAN regmap: %u ctx + %u sh entries move, %u warnings, fatal=%s",
+             moved_ctx, moved_sh, warn_ctx + warn_sh, ok ? "no" : "YES");
+   return ok;
+}
+
+int ac_titan_mapovr_n = 0;
+uint32_t ac_titan_mapovr_src[AC_TITAN_MAPOVR_MAX];
+uint32_t ac_titan_mapovr_dst[AC_TITAN_MAPOVR_MAX];
+
+void
+ac_titan_report_split_run(uint32_t base, uint32_t dw, uint32_t num, uint32_t d0, uint32_t dk,
+                          uint32_t k)
+{
+   /* Report each offending run once. */
+   static uint32_t seen[64];
+   static unsigned n_seen;
+   const uint32_t key = (base << 16) ^ (dw << 4) ^ num;
+
+   for (unsigned i = 0; i < n_seen; i++)
+      if (seen[i] == key)
+         return;
+   if (n_seen < ARRAY_SIZE(seen))
+      seen[n_seen++] = key;
+
+   RADV_LOGI("[XCLIPSE] SPLIT-RUN base=0x%05x dw=0x%03x num=%u : dw+%u lands at 0x%03x, "
+             "not 0x%03x -- this emission site must be split",
+             base, dw, num, k, dk, d0 + k);
+}
+
+void
+ac_titan_mapovr_parse(void)
+{
+   ac_titan_mapovr_n = 0;
+
+   const char *s = getenv("RADV_XCLIPSE_MAPOVR");
+   if (!s || !s[0])
+      return;
+
+   while (*s && ac_titan_mapovr_n < AC_TITAN_MAPOVR_MAX) {
+      char *end;
+      unsigned long src = strtoul(s, &end, 16);
+      if (end == s || *end != ':')
+         break;
+      unsigned long dst = strtoul(end + 1, &end, 16);
+      if (src > 0x3ff || dst > 0x3ff)
+         break;
+      ac_titan_mapovr_src[ac_titan_mapovr_n] = (uint32_t)src;
+      ac_titan_mapovr_dst[ac_titan_mapovr_n] = (uint32_t)dst;
+      ac_titan_mapovr_n++;
+      if (*end != ',')
+         break;
+      s = end + 1;
+   }
+
+   for (int i = 0; i < ac_titan_mapovr_n; i++)
+      RADV_LOGI("[XCLIPSE] TITAN map OVERRIDE %u/%u: ctx 0x%03x -> 0x%03x",
+                i + 1, ac_titan_mapovr_n, ac_titan_mapovr_src[i], ac_titan_mapovr_dst[i]);
+}
+
+void
+ac_titan_regmap_set_level(uint32_t level)
+{
+   /* Set the level before validating, so the validator checks the table actually used. */
+   ac_titan_regmap_level = level;
+   ac_titan_regmap_active = level > 0;
+
+   /* Parse overrides before validating too; a colliding override is refused like a bad table. */
+   ac_titan_mapovr_parse();
+
+   /* Refuse rather than half-apply: a colliding table is worse than no remap. */
+   if (level > 0 && !ac_titan_regmap_validate()) {
+      RADV_LOGI("[XCLIPSE] TITAN regmap REFUSED -- fix the table above; running unmapped");
+      ac_titan_regmap_active = false;
+      ac_titan_regmap_level = 0;
+   }
+}
+
 #include "util/macros.h"
 #include "util/u_math.h"
 #include "util/os_misc.h"
@@ -22,6 +180,329 @@
 #include <stdio.h>
 #include <ctype.h>
 #include <inttypes.h>
+
+#include <string.h>
+#include <stdlib.h>
+#ifdef __ANDROID__
+#include <sys/system_properties.h>
+#endif
+
+/* Which Xclipse is this? pci_id cannot tell: Samsung assigns 0x73A0 to every CHIP_VANGOGH_LITE.
+ * Primary signal: ro.soc.model. Corroboration: chip_rev (read from mmGRBM_CHIP_REVISION):
+ *
+ *     s5e9925 (S22U, Xclipse 920)  chip_rev 0x00600201  gen 0 mod 0x60  kernel family 144 VGH
+ *     s5e8845 (A55,  Xclipse 530)  chip_rev 0x01300100  gen 1 mod 0x30  kernel family 147 MGFX
+ *     s5e9945 (S24,  Xclipse 940, MAGELLAN CARL)  chip_rev 0x02600200  gen 2 mod 0x60  kernel family 147 MGFX
+ *     s5e8855 (Tab S10 FE, A56, Xclipse 540, ARIEL)  chip_rev 0x02300100  gen 2 mod 0x30  kernel family 147 MGFX
+ *     s5e9955 (Z Flip7, Xclipse 950, GALILEO)  chip_rev 0x03600200  gen 3 mod 0x60  kernel family 147 MGFX
+ *     s5e9965 (S26+, Xclipse 960, JUNO)  chip_rev 0x04600200  gen 4 mod 0x60  kernel family 147 MGFX
+ *     s5e8865 (A57, Xclipse 550, TRITON)  chip_rev 0x03300100  gen 3 mod 0x30  kernel family 147 MGFX
+ *
+ * On disagreement chip_rev wins and it is logged. Reports the decision and its source. */
+#define AC_MGFX_GEN(rev) (((rev) >> 24) & 0xff)
+#define AC_MGFX_MOD(rev) (((rev) >> 16) & 0xff)
+
+/* One row per chip; see struct ac_xclipse_chip. NONE (not an Xclipse) and UNKNOWN keep the
+ * upstream behaviour. Only the 920 was measured to need pacing; only the 940 froze on CP DMA
+ * prefetch (the 540 follows it: its vendor driver never prefetches either).
+ *
+ * pbb is the vendor's binner, decoded from its command stream (vspy): 64x64 bins where upstream
+ * floors them at 128x128, several states per bin instead of one, the allocation budget of a
+ * 1024-line parameter cache (341, where pc_lines 256 gives 85) and PA_SC_BINNER_CNTL_2, which
+ * upstream never writes on GFX10.3 (bit 22 SBB_ENABLE, 23 ENABLE_PING_PONG_BIN_ORDER, 24-25 the
+ * flip, 21 DISABLE_NOPCEXPORT_BREAKBATCH_CONDITION; field names from Samsung's gc_10_4_0 sh_mask
+ * headers). The 920 values are on: probe/gfx/perfax measures image copies +47%, blits +95%, buffer
+ * to image uploads +49%, alpha-tested fill +12% and nothing slower. The 530 values are
+ * its own: 4/32 states and 1792 prims per batch, PAL's MGfx defaults. Its bins are computed: the
+ * 530 has one RB and one TCC, so the upstream formula gives 64x64 for RGBA8 + depth (the vendor's
+ * value) and 32x32 for two RGBA16F targets. The 530 row is off: in Fenyx on the A55 it measured neutral
+ * (54.9 against 55.4 ms of GPU per frame, same session and spot). */
+static const struct ac_xclipse_chip ac_xclipse_chips[AC_XCLIPSE_MODEL_COUNT] = {
+   /*                       name       codename         titan  rt     ctxinit nopf   pacing unstable */
+   [AC_XCLIPSE_NONE]    = {"none",    NULL,            false, true,  false,  false, false, false},
+   [AC_XCLIPSE_920]     = {"920",     "VANGOGHLITE",   false, true,  false,  false, true,  false,
+                           {64, 3, 8, 0x03ff0154, 0x00c00000, true}},
+   [AC_XCLIPSE_530]     = {"530",     "TITAN",         true,  false, true,   false, false, false,
+                           {0, 4, 32, 0x06ff0154, 0x03e00000, false}},
+   [AC_XCLIPSE_940]     = {"940",     "MAGELLAN CARL", true,  true,  true,   true,  false, false},
+   [AC_XCLIPSE_540]     = {"540",     "ARIEL",         true,  false, true,   true,  false, false},
+   /* The 950's early vsprobe timeouts and the 960's draw timeouts were mid-IB preemption with
+    * register shadowing, now off on every Xclipse (see has_kernelq_reg_shadowing). The 950's BVH
+    * build hang predates that and is untested since. */
+   [AC_XCLIPSE_950]     = {"950",     "GALILEO",       true,  true,  true,   true,  false, false},
+   [AC_XCLIPSE_960]     = {"960",     "JUNO",          true,  true,  true,   true,  false, false},
+   /* The 550 is the 540 one generation on: no RT (its vendor driver exposes none), and like the
+    * other TITAN-map chips no CP DMA prefetch. */
+   [AC_XCLIPSE_550]     = {"550",     "TRITON",        true,  false, true,   true,  false, false},
+   [AC_XCLIPSE_UNKNOWN] = {"unknown", NULL,            false, true,  false,  false, false, false},
+};
+
+const struct ac_xclipse_chip *
+ac_xclipse_chip_info(const struct radeon_info *info)
+{
+   const unsigned m = info->xclipse_model;
+   return &ac_xclipse_chips[m < AC_XCLIPSE_MODEL_COUNT ? m : AC_XCLIPSE_UNKNOWN];
+}
+
+static int xclipse_knob_int(const char *env_name, const char *prop_name, const char **src_out);
+
+/* RADV_XCLIPSE_PBB / debug.radv_xclipse_pbb: 0 = upstream binning, 1 = the vendor's (on chips
+ * whose values are known), unset = the chip row's default. */
+const struct ac_xclipse_pbb *
+ac_xclipse_pbb(const struct radeon_info *info)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_PBB", "debug.radv_xclipse_pbb", &src);
+   }
+   const struct ac_xclipse_pbb *pbb = &ac_xclipse_chip_info(info)->pbb;
+   if (!pbb->cntl_1 || knob == 0)
+      return NULL;
+   return knob > 0 || pbb->on ? pbb : NULL;
+}
+
+/* RADV_XCLIPSE_DBFLUSH / debug.radv_xclipse_dbflush: flush DB with CACHE_FLUSH_AND_INV_TS (CB and DB
+ * together, as the vendor does on every Xclipse) instead of FLUSH_AND_INV_DB_DATA_TS plus
+ * FLUSH_AND_INV_DB_META, which the vendor never sends. Samsung's kernel (VOYAGERSW-1566, MGFX1-3):
+ * "DB has a limitation to handle concurrent z flush & request ... the problem disappears with
+ * removal of DB flush cache". Default: on for the 530 (MGFX1), whose rendering broke in games when
+ * t8 turned it off (2026-11-10), off elsewhere since 2026-11-09. 0 = off, 1 = on, on any Xclipse. */
+bool
+ac_xclipse_full_db_flush(const struct radeon_info *info)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_DBFLUSH", "debug.radv_xclipse_dbflush", &src);
+   }
+   if (info->xclipse_model == AC_XCLIPSE_NONE || knob == 0)
+      return false;
+   return knob > 0 || info->xclipse_model == AC_XCLIPSE_530;
+}
+
+/* RADV_XCLIPSE_MESH / debug.radv_xclipse_mesh: VK_EXT_mesh_shader, on by default; 0 hides it on
+ * any Xclipse. Measured on the 920 with probe/gfx/mshp (radv-xclipse issue 23 reports the same on
+ * the 940): direct mesh draws render; DISPATCH_MESH_INDIRECT_MULTI hangs the GPU with a draw count
+ * of 1, as does the indirect count form with a count of 1 or 0; every draw with a task shader has
+ * its submission refused by the kernel (EINVAL, no gang submit in sgpu, DRM 3.40). The vendor
+ * driver exposes no mesh shaders on any Xclipse. */
+bool
+ac_xclipse_mesh_shaders(const struct radeon_info *info)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_MESH", "debug.radv_xclipse_mesh", &src);
+   }
+   if (info->xclipse_model == AC_XCLIPSE_NONE)
+      return true;
+   return knob != 0;
+}
+
+/* RADV_XCLIPSE_SYNC263 / debug.radv_xclipse_sync263: emit barriers the Mesa 26.3 way on Xclipse
+ * (ac_barrier_state::xclipse_legacy_sync). On by default on every Xclipse; 0 = upstream 27.0. */
+bool
+ac_xclipse_legacy_sync(const struct radeon_info *info)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_SYNC263", "debug.radv_xclipse_sync263", &src);
+   }
+   return info->xclipse_model != AC_XCLIPSE_NONE && knob != 0;
+}
+
+/* RADV_XCLIPSE_SPI11 / debug.radv_xclipse_spi11: program the SPI wave launch registers as the
+ * vendor does. A bit mask, default 3, 0 = the values used before.
+ *
+ * Bit 0 (AC_XCLIPSE_SPI11_GS_RSRC4), chips with the 530's register map: program
+ * SPI_SHADER_PGM_RSRC3_GS and RSRC4_GS at all. Before, their per-pipeline writes were suppressed
+ * (at GFX10.3's offsets they hit the shader address) and stayed suppressed once the kernel's SH map
+ * could place them (0x08a, 0x08b). RADV never wrote either one: both kept whatever the last vendor
+ * context left there, or their reset value of 0 after the GPU lost power.
+ * From MGFX1 on, SPI_SHADER_PGM_RSRC4_GS has the GFX11 layout. CU_EN is bit 0 alone, and bits 14 and 15 are
+ * PH_THROTTLE_EN and SPI_THROTTLE_EN (Samsung's gc_10_4_0_sh_mask_m1.h and _m2.h; the 920's header
+ * still has CU_EN in bits 0-15). The GFX10.3 value CU_EN(0xffff) therefore turned both GS wave
+ * throttles on for every NGG pipeline. The vendor writes 0 in those 16 bits on the 530
+ * (0x82000000, 0x84800000 against 0x0200ffff, 0x0280ffff on the 920) and its Rsrc4GsThrottleEn
+ * setting defaults to 0.
+ *
+ * Bit 1 (AC_XCLIPSE_SPI11_PS_LDS_GROUP), every Xclipse: SPI_SHADER_PGM_RSRC3_PS.LDS_GROUP_SIZE = 1.
+ * The vendor writes 0x0040ffff on the 920 and on the 530, and upstream does the same on GFX11,
+ * whose pixel shaders these chips run. */
+unsigned
+ac_xclipse_spi11(const struct radeon_info *info)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_SPI11", "debug.radv_xclipse_spi11", &src);
+   }
+   if (info->xclipse_model == AC_XCLIPSE_NONE)
+      return 0;
+
+   unsigned mask = knob < 0 ? 3 : (unsigned)knob;
+   if (!ac_xclipse_chip_info(info)->titan_regmap)
+      mask &= ~AC_XCLIPSE_SPI11_GS_RSRC4;
+   return mask;
+}
+
+/* Like xclipse_knob_int but accepts 0x-prefixed hex, for register-shaped values. -1 = unset. */
+static int
+xclipse_knob_hex(const char *env_name, const char *prop_name, const char **src_out)
+{
+   const char *e = getenv(env_name);
+   char v[92] = {0};
+   const char *t = NULL;
+
+   if (e && e[0]) {
+      t = e;
+      *src_out = "env";
+   }
+#ifdef __ANDROID__
+   if (!t && __system_property_get(prop_name, v) > 0 && v[0]) {
+      t = v;
+      *src_out = "prop";
+   }
+#endif
+   if (t) {
+      char *end = NULL;
+      long l = strtol(t, &end, 0);
+      if (end && end != t && *end == 0)
+         return (int)l;
+   }
+   *src_out = "default";
+   return -1;
+}
+
+/* RADV_XCLIPSE_GS_CU / debug.radv_xclipse_gs_cu: CU_EN for SPI_SHADER_PGM_RSRC3_GS (hex), used with
+ * ac_xclipse_spi11 bit 0 to measure whether the chip honours the mask. -1 = unset. */
+/* RADV_XCLIPSE_TFQ / debug.radv_xclipse_tfq: the vendor's texture filter optimisations, on by
+ * default on every Xclipse. 0 = exact trilinear and anisotropic filtering on every texture. Returns
+ * the sampler bits: PERF_MIP in [3:0], 0x10 = the AMD anisotropic threshold and bias. Values above 1
+ * are taken as those bits, for measurements. */
+unsigned
+ac_xclipse_texture_filter_opt(void)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_int("RADV_XCLIPSE_TFQ", "debug.radv_xclipse_tfq", &src);
+   }
+   return knob < 0 || knob == 1 ? 0x1f : (unsigned)knob & 0x1f;
+}
+
+int
+ac_xclipse_gs_cu_en(void)
+{
+   static int knob = -2;
+   if (knob == -2) {
+      const char *src;
+      knob = xclipse_knob_hex("RADV_XCLIPSE_GS_CU", "debug.radv_xclipse_gs_cu", &src);
+   }
+   return knob;
+}
+
+/* Env var (only if non-empty and numeric), else Android property. -1 = not set anywhere.
+ * An empty env var must not mask the property. */
+static int
+xclipse_knob_int(const char *env_name, const char *prop_name, const char **src_out)
+{
+   const char *e = getenv(env_name);
+
+   if (e && e[0]) {
+      char *end = NULL;
+      long l = strtol(e, &end, 10);
+      if (end && end != e && *end == 0) {
+         *src_out = "env";
+         return (int)l;
+      }
+   }
+#ifdef __ANDROID__
+   {
+      char v[92] = {0};
+      if (__system_property_get(prop_name, v) > 0 && v[0]) {
+         *src_out = "prop";
+         return atoi(v);
+      }
+   }
+#endif
+   *src_out = "default";
+   return -1;
+}
+
+static enum ac_xclipse_model
+ac_model_from_chip_rev(uint32_t chip_rev)
+{
+   if (AC_MGFX_GEN(chip_rev) == 0 && AC_MGFX_MOD(chip_rev) == 0x60)
+      return AC_XCLIPSE_920;
+   if (AC_MGFX_GEN(chip_rev) == 1 && AC_MGFX_MOD(chip_rev) == 0x30)
+      return AC_XCLIPSE_530;
+   if (AC_MGFX_GEN(chip_rev) == 2 && AC_MGFX_MOD(chip_rev) == 0x60)
+      return AC_XCLIPSE_940;
+   if (AC_MGFX_GEN(chip_rev) == 2 && AC_MGFX_MOD(chip_rev) == 0x30)
+      return AC_XCLIPSE_540;
+   if (AC_MGFX_GEN(chip_rev) == 3 && AC_MGFX_MOD(chip_rev) == 0x60)
+      return AC_XCLIPSE_950;
+   if (AC_MGFX_GEN(chip_rev) == 3 && AC_MGFX_MOD(chip_rev) == 0x30)
+      return AC_XCLIPSE_550;
+   if (AC_MGFX_GEN(chip_rev) == 4 && AC_MGFX_MOD(chip_rev) == 0x60)
+      return AC_XCLIPSE_960;
+   return AC_XCLIPSE_UNKNOWN;
+}
+
+static enum ac_xclipse_model
+ac_detect_xclipse_model(uint32_t device_id, uint32_t chip_rev)
+{
+   enum ac_xclipse_model from_rev, model;
+   const char *src = "chip_rev";
+   char soc[92] = {0};
+
+   if (device_id != 0x73a0)
+      return AC_XCLIPSE_NONE;
+
+   from_rev = ac_model_from_chip_rev(chip_rev);
+   model = from_rev;
+
+#ifdef __ANDROID__
+   if (__system_property_get("ro.soc.model", soc) > 0 && soc[0])
+      src = "ro.soc.model";
+#endif
+
+   if (soc[0]) {
+      enum ac_xclipse_model from_soc = AC_XCLIPSE_UNKNOWN;
+      if (!strcmp(soc, "s5e9925") || !strcmp(soc, "s5e9935"))
+         from_soc = AC_XCLIPSE_920;
+      else if (!strcmp(soc, "s5e8845"))
+         from_soc = AC_XCLIPSE_530;
+      else if (!strcmp(soc, "s5e9945"))
+         from_soc = AC_XCLIPSE_940;
+      else if (!strcmp(soc, "s5e8855"))
+         from_soc = AC_XCLIPSE_540;
+      else if (!strcmp(soc, "s5e9955"))
+         from_soc = AC_XCLIPSE_950;
+      else if (!strcmp(soc, "s5e9965"))
+         from_soc = AC_XCLIPSE_960;
+      else if (!strcmp(soc, "s5e8865"))
+         from_soc = AC_XCLIPSE_550;
+
+      if (from_soc != AC_XCLIPSE_UNKNOWN && from_rev != AC_XCLIPSE_UNKNOWN &&
+          from_soc != from_rev) {
+         RADV_LOGI("[XCLIPSE] MISMATCH: %s says model %d but chip_rev 0x%08x says %d --"
+                   " trusting chip_rev", soc, from_soc, chip_rev, from_rev);
+      } else if (from_soc != AC_XCLIPSE_UNKNOWN) {
+         model = from_soc;
+      }
+   }
+
+   RADV_LOGI("[XCLIPSE] model=%s (%s) soc='%s' (from %s) chip_rev=0x%08x gen=%u mod=0x%02x",
+             ac_xclipse_chips[model].name,
+             ac_xclipse_chips[model].codename ? ac_xclipse_chips[model].codename : "-",
+             soc[0] ? soc : "?", src, chip_rev,
+             AC_MGFX_GEN(chip_rev), AC_MGFX_MOD(chip_rev));
+   return model;
+}
 
 #define AMDGPU_MI100_RANGE       0x32, 0x3C
 #define AMDGPU_MI200_RANGE       0x3C, 0x46
@@ -248,11 +729,14 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
 {
    /* We use ac_compiler_info for shader cache keys, so make sure there is no padding. */
    STATIC_ASSERT(sizeof(enum amd_gfx_level) == 4);
-   STATIC_ASSERT(sizeof(struct ac_compiler_info) == 60);
+   /* Upstream is 60; we add desc_gfx_level (4 bytes). This struct is a shader-cache key and must
+    * stay padding-free. */
+   STATIC_ASSERT(sizeof(struct ac_compiler_info) == 64);
 
    struct ac_compiler_info *out = &info->compiler_info;
 
    out->gfx_level = info->gfx_level;
+   out->desc_gfx_level = info->desc_gfx_level;
 
    if (info->gfx_level >= GFX10_3)
       out->max_waves_per_simd = 16;
@@ -349,6 +833,9 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
       (info->family >= CHIP_MI100 && info->family != CHIP_NAVI10 && info->family != CHIP_GFX1013);
    /* GFX1013 is GFX10 plus ray tracing instructions */
    out->has_image_bvh_intersect_ray = info->gfx_level >= GFX10_3 || info->family == CHIP_GFX1013;
+   /* Xclipse chips without ray tracing hardware (530, 540): no BVH instructions, no RT extensions. */
+   if (!ac_xclipse_chip_info(info)->has_rt)
+      out->has_image_bvh_intersect_ray = false;
 
    /* On newer chips, it is not necessary for NGG shaders to request
     * the allocation of GS space in passthrough mode, when they set
@@ -356,8 +843,13 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
     */
    out->has_ngg_passthru_no_msg = info->family >= CHIP_NAVI23;
 
+   /* The Xclipse 920 reports GFX10_3 but its SPI passes local invocation IDs the GFX11 way: packed
+    * in one VGPR (x = bits 0-9, y = 10-19, z = 20-29). Without this every 2D/3D-workgroup compute
+    * shader reads garbage IDs.
+    */
    out->local_invocation_ids_packed =
-      info->gfx_level >= GFX11 || (!info->has_graphics && info->family >= CHIP_MI200);
+      info->gfx_level >= GFX11 || info->gfx11_shader_core ||
+      (!info->has_graphics && info->family >= CHIP_MI200);
    out->has_fmask = info->gfx_level <= GFX10_3;
 
    out->has_3d_cube_border_color_mipmap = info->has_graphics || info->family == CHIP_MI100;
@@ -455,8 +947,10 @@ ac_fill_compiler_info(struct radeon_info *info, const struct drm_amdgpu_info_dev
       out->has_vrs_frag_pos_z_bug = true;
    }
 
-   out->has_desc_resource_level = (info->gfx_level >= GFX10 && info->gfx_level < GFX11) ||
-                                  info->family == CHIP_GFX1156;
+   /* GFX11 dropped RESOURCE_LEVEL, and the Xclipse texture unit is GFX11. */
+   out->has_desc_resource_level = ((info->gfx_level >= GFX10 && info->gfx_level < GFX11) ||
+                                   info->family == CHIP_GFX1156) &&
+                                  !info->gfx11_shader_core;
 }
 
 void
@@ -464,6 +958,19 @@ ac_fill_tiling_info(struct radeon_info *info, const struct amdgpu_gpu_info *amdi
 {
    info->mc_arb_ramcfg = amdinfo->mc_arb_ramcfg;
    info->gb_addr_config = amdinfo->gb_addr_cfg;
+
+   /* GB_ADDR_CONFIG override (RADV_XCLIPSE_GBCFG / debug.radv_xclipse_gbcfg, decimal or 0x hex).
+    * Samsung reports 0x142 (4 pipes, 2 packers) on every Xclipse, but the 530 has one TCC block and
+    * one RB. */
+   {
+      const char *src = "default";
+      int want = xclipse_knob_hex("RADV_XCLIPSE_GBCFG", "debug.radv_xclipse_gbcfg", &src);
+      if (want >= 0) {
+         RADV_LOGI("[XCLIPSE] gbcfg override 0x%08x -> 0x%08x (from %s)",
+                   info->gb_addr_config, (unsigned)want, src);
+         info->gb_addr_config = (uint32_t)want;
+      }
+   }
    if (info->gfx_level >= GFX9) {
       if (!info->has_graphics && info->family >= CHIP_GFX940)
          info->gb_addr_config = 0;
@@ -534,10 +1041,27 @@ ac_fill_hw_ip_info(struct radeon_info *info, const struct drm_amdgpu_info_device
             info->ip[AMD_IP_GFX].ver_minor = info->ip[AMD_IP_COMPUTE].ver_minor = 1;
          else if (device_info->family == FAMILY_NV ||
                   device_info->family == FAMILY_VGH ||
+                  /* Samsung Xclipse 530: the sgpu kernel reports GFX 10.0 (FAMILY_MGFX); it is
+                   * GFX10_3 like the 920 (FAMILY_VGH). Without this gfx_level resolves to GFX10_1. */
+                  device_info->family == FAMILY_MGFX ||
                   device_info->family == FAMILY_RMB ||
                   device_info->family == FAMILY_RPL ||
                   device_info->family == FAMILY_MDN)
             info->ip[AMD_IP_GFX].ver_minor = info->ip[AMD_IP_COMPUTE].ver_minor = 3;
+      }
+   }
+
+   /* GFX IP version override (RADV_XCLIPSE_GFXIP / debug.radv_xclipse_gfxip, as MMm: 100 = 10.0,
+    * 103 = 10.3, 110 = 11.0). MGFX1 is forced to GFX10_3 by analogy with the 920; this tests it. */
+   {
+      const char *src = "default";
+      int want = xclipse_knob_int("RADV_XCLIPSE_GFXIP", "debug.radv_xclipse_gfxip", &src);
+      if (want > 0) {
+         unsigned mj = (unsigned)want / 10, mn = (unsigned)want % 10;
+         RADV_LOGI("[XCLIPSE] gfxip override %u.%u -> %u.%u (from %s)",
+                   info->ip[AMD_IP_GFX].ver_major, info->ip[AMD_IP_GFX].ver_minor, mj, mn, src);
+         info->ip[AMD_IP_GFX].ver_major = info->ip[AMD_IP_COMPUTE].ver_major = mj;
+         info->ip[AMD_IP_GFX].ver_minor = info->ip[AMD_IP_COMPUTE].ver_minor = mn;
       }
    }
 
@@ -573,6 +1097,14 @@ ac_fill_memory_info(struct radeon_info *info, const struct drm_amdgpu_info_devic
    info->virtual_address_alignment = device_info->virtual_address_alignment;
    /* Set which chips have dedicated VRAM. */
    info->has_dedicated_vram = !(device_info->ids_flags & AMDGPU_IDS_FLAGS_FUSION);
+
+   /* Samsung Xclipse 920 (0x73a0): no dedicated VRAM, but keep has_dedicated_vram true for the
+    * 1-heap memory topology (the APU 2-heap split breaks CS buffer writes). max_heap_size =
+    * gart_size since vram_size is 0. */
+   if (device_info->device_id == 0x73a0) {
+      info->all_vram_visible = false;
+   }
+
    /* The kernel can split large buffers in VRAM but not in GTT, so large
     * allocations can fail or cause buffer movement failures in the kernel.
     */
@@ -580,6 +1112,28 @@ ac_fill_memory_info(struct radeon_info *info, const struct drm_amdgpu_info_devic
       info->max_heap_size_kb = info->vram_size_kb;
    else
       info->max_heap_size_kb = info->gart_size_kb;
+
+   /* Xclipse 920: vram_size=0, so override max_heap_size to gart_size */
+   if (device_info->device_id == 0x73a0)
+      info->max_heap_size_kb = info->gart_size_kb;
+
+   /* Build marker (logcat -s RADV_BUILD:I). Emulators cache the extracted .so, so confirm the marker
+    * before trusting a run; pass -DRADV_XCLIPSE_BUILD=\"name\" in c_args to tell builds apart. */
+#ifndef RADV_XCLIPSE_BUILD
+#define RADV_XCLIPSE_BUILD "Mesa " PACKAGE_VERSION
+#endif
+   /* api= matters: ANDROID_API_LEVEL gates the AHB import and format paths in vk_android.c. */
+#ifndef ANDROID_API_LEVEL
+#define ANDROID_API_LEVEL 0
+#endif
+   AC_XCLIPSE_LOGP(ANDROID_LOG_INFO, "RADV_BUILD", "[BUILD] %s api=%d", RADV_XCLIPSE_BUILD,
+                       (int)ANDROID_API_LEVEL);
+   RADV_LOGI("[MEM_INFO] gfx_level=%u family=%u device_id=0x%x", info->gfx_level, info->family, device_info->device_id);
+   RADV_LOGI("[MEM_INFO] vram_size=%u KB gart_size=%u KB vram_vis=%u KB", info->vram_size_kb, info->gart_size_kb, info->vram_vis_size_kb);
+   RADV_LOGI("[MEM_INFO] has_dedicated_vram=%d all_vram_visible=%d max_heap_size=%u KB",
+             info->has_dedicated_vram, info->all_vram_visible, info->max_heap_size_kb);
+   RADV_LOGI("[MEM_INFO] vram_type=%u memory_bus_width=%u ids_flags=0x%llx",
+             info->vram_type, info->memory_bus_width, (unsigned long long)device_info->ids_flags);
 
    info->vram_type = device_info->vram_type;
    info->memory_bus_width = device_info->vram_bit_width;
@@ -615,9 +1169,30 @@ ac_fill_memory_info(struct radeon_info *info, const struct drm_amdgpu_info_devic
     */
    info->smem_cache_line_size = info->gfx_level >= GFX10 ? 128 : 64;
 
+   /* Samsung Xclipse 920 (0x73a0): early firmware reported num_tcc_blocks=0. It has VANGOGH's GL2
+    * cache topology (4 TCC blocks); without this GL2 colour caching is disabled and images break.
+    * Current kernels report it themselves (2026-10-28: 920 and 960 say 4, the 530 says 1), so this
+    * only covers old firmware. The 960's 4 against its 8 GB_ADDR_CONFIG pipes changes nothing:
+    * binning takes MAX2(8 RBs, tcc) and tcc_rb_non_coherent is false for any power of two. */
+   if (device_info->device_id == 0x73a0 && info->max_tcc_blocks == 0) {
+      info->max_tcc_blocks = 4;
+      info->num_tcc_blocks = 4;
+      info->tcc_cache_line_size = 128;
+   }
+
+   RADV_LOGI("[MEM_INFO] max_tcc_blocks=%u num_tcc_blocks=%u tcc_cache_line=%u (kernel: tcc %u "
+             "disabled 0x%" PRIx64 " gl2c %u KB)",
+             info->max_tcc_blocks, info->num_tcc_blocks, info->tcc_cache_line_size,
+             device_info->num_tcc_blocks, (uint64_t)device_info->tcc_disabled_mask,
+             device_info->gl2c_cache_size);
+
    /* Firmware wrongly reports 0 bytes of MALL being present on Navi33.
-    * Work around this by manually computing cache sizes. */
-   if (info->gfx_level >= GFX11 && info->family != CHIP_NAVI33) {
+    * Work around this by manually computing cache sizes.
+    *
+    * Samsung's sgpu kernel does not fill gl2c_cache_size either; without the fallback a GFX11
+    * classification of the 530 gets a zero-sized attribute ring. */
+   if (info->gfx_level >= GFX11 && info->family != CHIP_NAVI33 &&
+       device_info->gl2c_cache_size) {
       info->tcp_cache_size = device_info->tcp_cache_size * 1024;
       info->l1_cache_size = device_info->gl1c_cache_size * 1024;
       info->l2_cache_size = device_info->gl2c_cache_size * 1024;
@@ -670,6 +1245,10 @@ ac_fill_memory_info(struct radeon_info *info, const struct drm_amdgpu_info_devic
       }
    }
 
+   RADV_LOGI("[MEM_INFO] kernel_gl2c=%u -> l2=%u tcp=%u l1=%u l3_mb=%u",
+             device_info->gl2c_cache_size, info->l2_cache_size, info->tcp_cache_size,
+             info->l1_cache_size, info->l3_cache_size_mb);
+
    info->pte_fragment_size = device_info->pte_fragment_size;
    info->gart_page_size = device_info->gart_page_size;
 }
@@ -680,6 +1259,8 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
    /* Set chip identification. */
    info->pci_id = device_info->device_id;
    info->pci_rev_id = device_info->pci_rev;
+   /* Resolve the Xclipse model before anything consults it (0x73A0 covers several parts). */
+   info->xclipse_model = ac_detect_xclipse_model(device_info->device_id, device_info->chip_rev);
    info->vce_harvest_config = device_info->vce_harvest_config;
 
    info->family = CHIP_UNKNOWN;
@@ -746,6 +1327,16 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
          break;
       case FAMILY_VGH:
          identify_chip(VANGOGH);
+         break;
+      case FAMILY_MGFX:
+         /* Samsung Xclipse 530 and up: same shader core as the 920 (fewer CUs and L2 slices, both
+          * read from the kernel). external_rev is 0x0A (0x80 on the 920); AMDGPU_VANGOGH_RANGE
+          * (0x01..0xFF) matches both. The 940 (MGFX2) reports the raw GRBM_CHIP_REVISION instead
+          * (0x02600200: the kernel's nv.c, "PAL needs raw value ... for M2"). */
+         if (device_info->external_rev > 0xff)
+            info->family = CHIP_VANGOGH;
+         else
+            identify_chip(VANGOGH);
          break;
       case FAMILY_RMB:
          identify_chip(REMBRANDT);
@@ -822,6 +1413,94 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
       fprintf(stderr, "amdgpu: Unknown gfx version: %u.%u\n",
                info->ip[AMD_IP_GFX].ver_major, info->ip[AMD_IP_GFX].ver_minor);
       return false;
+   }
+
+   /* CHIP_TITAN: the 530 as its own family (RADV_XCLIPSE_TITAN).
+    * TITAN is its AMD codename (MGFX_MOD 0x30 = AMDGPU_IS_MGFX1_MID; the 920 is MOD 0x60 GEN 0,
+    * VOYAGER). Its context register map differs per block (ac_titan_regmap.h). gfx_level stays
+    * GFX10_3; the GFX11 shader core is carried by gfx11_shader_core.
+    *
+    * The 940 (MAGELLAN CARL, MGFX2) takes the same path: the Samsung kernel's gc_10_4_0_offset_m2.h gives every
+    * register it shares with gc_10_4_0_offset_m1.h (3740 of them, all 670 context registers) the
+    * same offset. Its 12 names of its own are privileged (RLC, GL2C, SPI reserve for CU 8/9).
+    * The 540 (MGFX2_MID) is built with the same m2 header: only the privileged GL2ACEM LLC
+    * registers move, and every field layout matches the 940's. */
+   if (ac_xclipse_chip_info(info)->titan_regmap) {
+      const char *tsrc = "default";
+      int twant = xclipse_knob_int("RADV_XCLIPSE_TITAN", "debug.radv_xclipse_titan", &tsrc);
+
+      /* Default on at level 10: level 0 wedges the GPU on the first draw. Level 10 (DB table) is
+       * needed for stencil. Depth writes are still broken at both 9 and 10. Only reached on the
+       * 530. 0 = off; lower levels bisect a regression to a block. */
+      if (twant < 0)
+         twant = 10;
+
+      if (twant > 0) {
+         const char *ssrc = "default";
+         int swant = xclipse_knob_int("RADV_XCLIPSE_TITAN_SUP", "debug.radv_xclipse_titan_sup", &ssrc);
+         ac_titan_regmap_suppress = swant != 0;   /* -1 = unset = on */
+         info->family = CHIP_TITAN;
+         ac_titan_regmap_set_level(twant);
+         ac_titan_sh_cu_masks =
+            ac_titan_kmap_level() >= 2 && (ac_xclipse_spi11(info) & AC_XCLIPSE_SPI11_GS_RSRC4);
+         RADV_LOGI("[XCLIPSE] TITAN suppress=%d (from %s)", ac_titan_regmap_suppress, ssrc);
+         {
+            const char *csrc = "default";
+            int cwant = xclipse_knob_int("RADV_XCLIPSE_TITAN_CBEXT", "debug.radv_xclipse_titan_cbext", &csrc);
+            ac_titan_cb_ext_slot = cwant;   /* -1 = unset = keep GFX10_3's BASE_EXT array */
+            RADV_LOGI("[XCLIPSE] TITAN cb_ext_slot=%d (from %s)", ac_titan_cb_ext_slot, csrc);
+            const char *vsrc = "default";
+            int vwant = xclipse_knob_int("RADV_XCLIPSE_TITAN_CBVIEW", "debug.radv_xclipse_titan_cbview", &vsrc);
+            /* Default on. It was off because writing it cost Super Mario 3D World 25x its frame
+             * rate; that was the write for MRT 2+ landing on other targets' INFO/CMASK/DCC_BASE
+             * through a double remap (see radv_cmd_buffer.c). 0 leaves it unwritten. */
+            ac_titan_cb_view_slot = vwant >= 0 ? vwant : 1;
+            RADV_LOGI("[XCLIPSE] TITAN cb_view_slot=%d (from %s)", ac_titan_cb_view_slot, vsrc);
+         }
+         RADV_LOGI("[XCLIPSE] family -> CHIP_TITAN (%d), register remap LEVEL %d (from %s)",
+                   CHIP_TITAN, ac_titan_regmap_level, tsrc);
+      }
+   }
+
+   /* Samsung Xclipse 920 (Exynos 2200): GFX10_3 command processor and registers, GFX11 shader
+    * core. Genuine Van Gogh (Steam Deck) is a real GFX10.3 part, and PCI ID 0x73a0 on its own
+    * also falls in Navi 21's range, so both have to match.
+    * Keyed on xclipse_model too, so CHIP_TITAN keeps the GFX11 ISA.
+    */
+   info->gfx11_shader_core =
+      (info->family == CHIP_VANGOGH || info->xclipse_model != AC_XCLIPSE_NONE) && info->pci_id == 0x73a0;
+
+   /* Shader core generation (RADV_XCLIPSE_SHADERCORE / debug.radv_xclipse_shadercore:
+    * 0 = GFX10_3, 11 = GFX11). Decides which ISA ACO emits; established on the 920 only. */
+   if (info->xclipse_model != AC_XCLIPSE_NONE) {
+      const char *src = "default";
+      int want = xclipse_knob_int("RADV_XCLIPSE_SHADERCORE", "debug.radv_xclipse_shadercore", &src);
+      if (want == 0)
+         info->gfx11_shader_core = false;
+      else if (want == 11)
+         info->gfx11_shader_core = true;
+      if (want != -1)
+         RADV_LOGI("[XCLIPSE] shadercore knob=%d (from %s) -> gfx11_shader_core=%d",
+                   want, src, info->gfx11_shader_core);
+   }
+
+   info->desc_gfx_level = info->gfx11_shader_core ? GFX11 : info->gfx_level;
+
+   /* Descriptor format (RADV_XCLIPSE_DESCGFX / debug.radv_xclipse_descgfx):
+    *      unset -> inherited behaviour
+    *      10    -> build descriptors at gfx_level (GFX10_3)
+    *      11    -> force GFX11 descriptors
+    * Logs the value and its source. */
+   if (info->xclipse_model != AC_XCLIPSE_NONE) {
+      const char *src = "default";
+      int want = xclipse_knob_int("RADV_XCLIPSE_DESCGFX", "debug.radv_xclipse_descgfx", &src);
+      if (want == 10)
+         info->desc_gfx_level = info->gfx_level;
+      else if (want == 11)
+         info->desc_gfx_level = GFX11;
+      RADV_LOGI("[XCLIPSE] descgfx knob=%d (from %s) -> desc_gfx_level=%d gfx_level=%d"
+                " gfx11_shader_core=%d", want, src, info->desc_gfx_level, info->gfx_level,
+                info->gfx11_shader_core);
    }
 
 
@@ -948,9 +1627,19 @@ ac_identify_chip(struct radeon_info *info, const struct drm_amdgpu_info_device *
       info->rt_ip_version = RT_2_0;
    else if (info->gfx_level >= GFX10_3 || info->family == CHIP_GFX1013)
       info->rt_ip_version = RT_1_1;
+   if (!ac_xclipse_chip_info(info)->has_rt)
+      info->rt_ip_version = RT_NONE;
 
    info->family_id = device_info->family;
+   /* addrlib only knows AMD family ids; Samsung's 147 (AMDGPU_FAMILY_MGFX) makes Addr::Lib::Create
+    * raise SIGTRAP. Use Van Gogh (same GFX10_3 addressing as the 920). chip_external_rev 0x0A is
+    * inside AMDGPU_VANGOGH_RANGE. Other family_id users only compare against FAMILY_AI. */
+   if (info->family_id == FAMILY_MGFX)
+      info->family_id = FAMILY_VGH;
    info->chip_external_rev = device_info->external_rev;
+   /* addrlib checks the revision against the family's range too: give the 940 the 530's. */
+   if (device_info->family == FAMILY_MGFX && info->chip_external_rev > 0xff)
+      info->chip_external_rev = 0x0a;
    info->chip_rev = device_info->chip_rev;
 
    return true;
@@ -1152,6 +1841,11 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
 
    info->has_tmz_support = device_info->ids_flags & AMDGPU_IDS_FLAGS_TMZ;
 
+   /* Samsung Xclipse 920 (0x73a0): the kernel reports TMZ, but there is no PSP / secure memory.
+    * Any RADEON_FLAG_ENCRYPTED allocation panics the sgpu driver. Force TMZ off. */
+   if (device_info->device_id == 0x73a0)
+      info->has_tmz_support = false;
+
    /* On GFX8, the TBA/TMA registers can be configured from the userspace.
     * On GFX9+, they are privileged registers and they need to be configured
     * from the kernel but it's not suppported yet.
@@ -1163,6 +1857,20 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
     * GFX11+ supports CLEAR_STATE, but we have decided not to use it.
     */
    info->has_clear_state = info->gfx_level >= GFX7 && info->gfx_level < GFX11;
+
+   /* CLEAR_STATE override (RADV_XCLIPSE_HAS_CLEARSTATE / debug.radv_xclipse_has_clearstate:
+    * 0 = off). With it RADV skips PA_SC_VPORT_SCISSOR_*, ZMIN/ZMAX and PA_SC_EDGERULE (radv_queue.c);
+    * PAL never uses CLEAR_STATE and writes them all explicitly. */
+   if (info->pci_id == 0x73a0) {
+      const char *src = "default";
+      int want = xclipse_knob_int("RADV_XCLIPSE_HAS_CLEARSTATE",
+                                  "debug.radv_xclipse_has_clearstate", &src);
+      if (want == 0 || want == 1) {
+         RADV_LOGI("[XCLIPSE] has_clear_state %d -> %d (from %s)",
+                   info->has_clear_state, want, src);
+         info->has_clear_state = want == 1;
+      }
+   }
 
    info->has_distributed_tess =
       info->gfx_level >= GFX10 || (info->gfx_level >= GFX8 && info->max_se >= 2);
@@ -1231,6 +1939,15 @@ void ac_fill_feature_info(struct radeon_info *info, const struct drm_amdgpu_info
    info->has_kernelq_reg_shadowing = device_info->ids_flags & AMDGPU_IDS_FLAGS_PREEMPTION &&
                                      info->gfx_level < GFX11 &&
                                      !(info->userq_ip_mask & (1 << AMD_IP_GFX));
+
+   /* Xclipse: never shadow registers. With shadowing on, every GFX IB is submitted preemptible
+    * and the CP restores state after a mid-IB preemption from the shadowed ranges, which are
+    * upstream's GFX10.3 offsets: the TITAN map moves hundreds of registers, so part of the state
+    * is not restored and the resumed job runs on whatever the preempting process left. The sgpu
+    * kernels of the 950 and 960 enable MCBP by default (amdgpu_mcbp = 2) and report PREEMPTION,
+    * and those two chips timed out intermittently; the 940 and 530 here never reported it. */
+   if (info->xclipse_model != AC_XCLIPSE_NONE)
+      info->has_kernelq_reg_shadowing = false;
 
    if (info->gfx_level >= GFX12) {
       info->has_set_context_pairs = true;
@@ -1401,6 +2118,7 @@ void ac_fill_hw_info(struct radeon_info *info, const struct drm_amdgpu_info_devi
          pc_lines = 512;
          break;
       case CHIP_VANGOGH:
+      case CHIP_TITAN:
       case CHIP_REMBRANDT:
       case CHIP_RAPHAEL_MENDOCINO:
          pc_lines = 256;
@@ -1530,11 +2248,9 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
    info->is_amdgpu = true;
 
    if (info->drm_minor < AC_AMDGPU_DRM_MINOR) {
-      fprintf(stderr, "amdgpu: DRM version is %u.%u.%u, but this driver is "
-                      "only compatible with %u.%u.0 (kernel 6.11.2+) or later.\n",
+      fprintf(stderr, "amdgpu: DRM version is %u.%u.%u (< %u.%u); continuing.\n",
               info->drm_major, info->drm_minor, info->drm_patchlevel,
               AC_AMDGPU_DRM_MAJOR, AC_AMDGPU_DRM_MINOR);
-      return false;
    }
 
    if (ac_drm_device_get_sync_provider(dev)->wait == NULL) {
@@ -1648,6 +2364,17 @@ ac_query_gpu_info(int fd, void *dev_p, struct radeon_info *info,
 
    if (!ac_identify_chip(info, &device_info))
       return false;
+
+   /* Xclipse chips that are not stable yet are refused, so the app falls back to the vendor
+    * driver. MESA_XCLIPSE_UNSTABLE=1 or setprop debug.mesa_xclipse_unstable 1 accepts them. */
+   if (ac_xclipse_chip_info(info)->unstable) {
+      const char *src;
+      if (xclipse_knob_int("MESA_XCLIPSE_UNSTABLE", "debug.mesa_xclipse_unstable", &src) <= 0) {
+         RADV_LOGI("[XCLIPSE] Xclipse %s is not supported yet (MESA_XCLIPSE_UNSTABLE=1 to try it)",
+                   ac_xclipse_chip_info(info)->name);
+         return false;
+      }
+   }
 
    const char *marketing_name = ac_drm_get_marketing_name(dev);
    strncpy(info->marketing_name, marketing_name ? marketing_name : "AMD Unknown", sizeof(info->marketing_name));
@@ -1952,6 +2679,12 @@ static void ac_print_gpu_modifiers(FILE *f, const struct radeon_info *const info
          free(name);
       }
    }
+}
+
+const char *ac_get_gpu_display_name(const struct radeon_info *info)
+{
+   const char *codename = ac_xclipse_chip_info(info)->codename;
+   return codename ? codename : ac_get_family_name(info->family);
 }
 
 void ac_print_gpu_info(FILE *f, const struct radeon_info *info, int fd)
