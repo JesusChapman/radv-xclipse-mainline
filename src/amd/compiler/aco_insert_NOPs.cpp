@@ -1101,6 +1101,16 @@ resolve_all_gfx10(State& state, NOP_ctx_gfx10& ctx,
    if (ctx.waits_since_fp_atomic < 3)
       bld.sopp(aco_opcode::s_nop, 3 - ctx.waits_since_fp_atomic - 1);
 
+   /* NSA_AND_CLAUSE_CAN_HANG (Samsung bug 8448): NSA MIMG at block boundary can hang GFX10.3.
+    * Also covers NSA_CANNOT_BE_LAST_IN_CLAUSE (bug 6037).
+    * Insert s_nop to ensure NSA MIMG is not the last instruction before a block boundary.
+    */
+   if (state.program->gfx_level <= GFX10_3 && ctx.has_NSA_MIMG) {
+      ctx.has_NSA_MIMG = false;
+      if (new_instructions.size() == prev_count)
+         bld.sopp(aco_opcode::s_nop, 0);
+   }
+
    if (state.program->gfx_level != GFX10)
       return; /* no other hazards/bugs to mitigate */
 
@@ -1252,8 +1262,8 @@ handle_lds_direct_valu_hazard(State& state, aco_ptr<Instruction>& instr)
    /* LdsDirectVALUHazard
     * Handle LDSDIR writing a VGPR after it's used by a VALU instruction.
     */
-   if (instr->ldsdir().wait_vdst == 0)
-      return 0; /* early exit */
+   if (instr->ldsdir().wait_vdst == 0 || state.program->dev.ldsdir_valu_drain)
+      return 0; /* early exit; Xclipse waits for every VALU (aco_compiler_options) */
 
    LdsDirectVALUHazardGlobalState global_state;
    global_state.wait_vdst = instr->ldsdir().wait_vdst;
@@ -1422,8 +1432,10 @@ handle_instruction_gfx11(State& state, NOP_ctx_gfx11& ctx, aco_ptr<Instruction>&
 {
    Builder bld(state.program, &new_instructions);
 
-   /* Due to a hazard, an s_nop is needed before "s_sendmsg sendmsg_dealloc_vgprs". */
+   /* Due to a hazard, an s_nop is needed before "s_sendmsg sendmsg_dealloc_vgprs".
+    * On the Xclipse hybrid imm 3 is GS_DONE (GFX10.3 message bus): no such hazard. */
    if (instr->opcode == aco_opcode::s_sendmsg && instr->salu().imm == sendmsg_dealloc_vgprs &&
+       !state.program->gfx10_sendmsg &&
        (new_instructions.empty() || new_instructions.back()->opcode != aco_opcode::s_nop)) {
       bld.sopp(aco_opcode::s_nop, 0);
    }

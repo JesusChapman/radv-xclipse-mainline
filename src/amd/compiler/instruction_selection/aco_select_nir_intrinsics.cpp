@@ -89,6 +89,10 @@ emit_bpermute(isel_context* ctx, Builder& bld, Temp index, Temp data)
       /* wave32 or GFX8-9, GFX12+: bpermute works normally */
       Temp index_x4 = bld.vop2(aco_opcode::v_lshlrev_b32, bld.def(v1), Operand::c32(2u), index);
       return bld.ds(aco_opcode::ds_bpermute_b32, bld.def(v1), index_x4, data);
+   } else if (ctx->program->dev.no_permlane64) {
+      /* Xclipse: GFX11 ISA without v_permlane64_b32 or shared VGPRs: one readlane per lane. */
+      return bld.pseudo(aco_opcode::p_bpermute_readlane, bld.def(v1), bld.def(bld.lm),
+                        bld.def(bld.lm, vcc), index, data);
    } else if (ctx->options->gfx_level >= GFX11 || can_use_shared_vgprs(ctx)) {
       /* GFX10-11.5 wave64 mode: emulate full-wave bpermute */
       Temp index_is_lo =
@@ -1480,7 +1484,12 @@ visit_load_per_vertex_input(isel_context* ctx, nir_intrinsic_instr* instr)
 ac_hw_cache_flags
 get_cache_flags(isel_context* ctx, unsigned access, enum ac_access_type type)
 {
-   return ac_get_hw_cache_flags(ctx->program->gfx_level, (gl_access_qualifier)access, type);
+   ac_hw_cache_flags flags =
+      ac_get_hw_cache_flags(ctx->program->gfx_level, (gl_access_qualifier)access, type);
+   if (ctx->options->device_scope_dlc && type == ac_access_type_load &&
+       (access & (ACCESS_COHERENT | ACCESS_VOLATILE)))
+      flags.value |= ac_dlc;
+   return flags;
 }
 
 ac_hw_cache_flags
@@ -1625,11 +1634,16 @@ visit_bvh64_intersect_ray_amd(isel_context* ctx, nir_intrinsic_instr* instr)
    /* Use vector-aligned scalar operands in order to avoid unnecessary copies
     * when creating vectors.
     */
+   /* Xclipse 920 (gfx10_nsa): GFX11 encoding, but the NSA operands are read the GFX10.3 way, one
+    * VGPR per address dword, with the NSA dword count in bits [1:0]. Grouped GFX11 operands make
+    * it take the node pointer's high half from the extent register and so on: every ray misses.
+    * PAL emits the per-dword form (3 NSA dwords); so do we. */
+   const bool grouped_nsa = bld.program->gfx_level >= GFX11 && !bld.program->gfx10_nsa;
    std::vector<Operand> scalar_args;
    for (Temp tmp : args) {
       for (unsigned i = 0; i < tmp.size(); i++) {
          scalar_args.push_back(Operand(emit_extract_vector(ctx, tmp, i, v1)));
-         if (bld.program->gfx_level >= GFX11 || bld.program->gfx_level < GFX10_3)
+         if (grouped_nsa || bld.program->gfx_level < GFX10_3)
             scalar_args.back().setVectorAligned(true);
       }
       /* GFX10: cannot use NSA and must treat all Operands as one large vector. */
@@ -2780,7 +2794,7 @@ visit_load_buffer(isel_context* ctx, nir_intrinsic_instr* intrin)
    /* Swizzled buffer addressing seems to be broken on GFX11 without the idxen bit. */
    bool swizzled = nir_intrinsic_access(intrin) & ACCESS_IS_SWIZZLED_AMD;
    bool idxen =
-      (swizzled && ctx->program->gfx_level >= GFX11) ||
+      (swizzled && ctx->program->gfx_level >= GFX11 && !ctx->options->swizzle_no_idxen) ||
       /* GFX9 uses IDXEN to select bounds checking behavior */
       (ctx->program->gfx_level == GFX9 && nir_intrinsic_access(intrin) & ACCESS_USES_FORMAT_AMD) ||
       !nir_src_is_const(intrin->src[3]) || nir_src_as_uint(intrin->src[3]);
@@ -2871,7 +2885,7 @@ visit_store_buffer(isel_context* ctx, nir_intrinsic_instr* intrin)
    /* Swizzled buffer addressing seems to be broken on GFX11 without the idxen bit. */
    bool swizzled = nir_intrinsic_access(intrin) & ACCESS_IS_SWIZZLED_AMD;
    bool idxen =
-      (swizzled && ctx->program->gfx_level >= GFX11) ||
+      (swizzled && ctx->program->gfx_level >= GFX11 && !ctx->options->swizzle_no_idxen) ||
       /* GFX9 uses IDXEN to select bounds checking behavior */
       (ctx->program->gfx_level == GFX9 && nir_intrinsic_access(intrin) & ACCESS_USES_FORMAT_AMD) ||
       !nir_src_is_const(intrin->src[4]) || nir_src_as_uint(intrin->src[4]);
@@ -3654,7 +3668,7 @@ emit_rotate_by_constant(isel_context* ctx, Temp& dst, Temp src, unsigned cluster
       dst = bld.ds(aco_opcode::ds_swizzle_b32, bld.def(v1), src, ctrl);
    } else if (cluster_size == 64) {
       bool has_wf_dpp = ctx->program->gfx_level >= GFX8 && ctx->program->gfx_level < GFX10;
-      if (delta == 32 && ctx->program->gfx_level >= GFX11) {
+      if (delta == 32 && ctx->program->gfx_level >= GFX11 && !ctx->program->dev.no_permlane64) {
          dst = bld.vop1(aco_opcode::v_permlane64_b32, bld.def(rc), src);
       } else if (delta == 32 && can_use_shared_vgprs(ctx)) {
          enable_shared_vgprs(ctx);
