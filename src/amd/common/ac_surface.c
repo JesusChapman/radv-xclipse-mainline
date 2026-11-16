@@ -3564,14 +3564,6 @@ static int gfx9_compute_surface(struct ac_addrlib *addrlib, const struct radeon_
    if (xclipse_4k_r_x)
       AddrSurfInfoIn.swizzleMode = ADDR_SW_4KB_D_X;
 
-   /* Xclipse (GFX10.3): addrlib's Gfx10Lib rejects SW_4KB_R_X (Samsung gralloc's GPU-only layout). It has
-    * the 4KB_D_X block size, padding and alignment, so lay the surface out as D_X and give the
-    * hardware R_X: probe/gfx/ahbmod decodes the vendor's buffer byte for byte that way. */
-   const bool xclipse_4k_r_x = info->xclipse_model != AC_XCLIPSE_NONE &&
-                               info->gfx_level < GFX11 && AddrSurfInfoIn.swizzleMode == ADDR_SW_4KB_R_X;
-   if (xclipse_4k_r_x)
-      AddrSurfInfoIn.swizzleMode = ADDR_SW_4KB_D_X;
-
    /* Calculate texture layout information. */
    if (!only_stencil) {
       r = gfx9_compute_miptree(addrlib, info, config, surf, compressed, &AddrSurfInfoIn,
