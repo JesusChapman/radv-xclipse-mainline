@@ -15550,14 +15550,12 @@ static uint64_t
 radv_xclipse_convert_draw_mesh_tasks(struct radv_cmd_buffer *cmd_buffer, const struct radv_draw_info *info,
                                      uint32_t max_count, bool task)
 {
-   unsigned offset;
+   uint64_t dst_va;
 
-   if (!radv_cmd_buffer_upload_alloc_aligned(cmd_buffer, max_count * 16, 16, &offset, NULL)) {
+   if (!radv_cmd_buffer_upload_alloc(cmd_buffer, max_count * 16, 16, &dst_va, NULL)) {
       vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
       return 0;
    }
-
-   const uint64_t dst_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + offset;
 
    radv_xclipse_convert_mesh_tasks(cmd_buffer, info->indirect_va, info->stride, info->count_va, max_count, task,
                                    dst_va);
@@ -15932,14 +15930,11 @@ radv_CmdDrawMeshTasksIndirectCount2EXT(VkCommandBuffer commandBuffer, const VkDr
       if (pdev->info.has_taskmesh_indirect0_bug && info.count_va) {
          /* Allocate a 32-bit value for the MEC firmware bug workaround. */
          uint32_t workaround_cond_init = 0;
-         uint32_t workaround_cond_off;
 
-         if (!radv_cmd_buffer_upload_data(cmd_buffer, 4, &workaround_cond_init, &workaround_cond_off)) {
+         if (!radv_cmd_buffer_upload_data(cmd_buffer, 4, 4, &workaround_cond_init, &workaround_cond_va)) {
             vk_command_buffer_set_error(&cmd_buffer->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
             return;
          }
-
-         workaround_cond_va = radv_buffer_get_va(cmd_buffer->upload.upload_bo) + workaround_cond_off;
       }
 
       radv_emit_indirect_taskmesh_draw_packets(device, &cmd_buffer->state, cs, cmd_buffer->gang.cs, &info,
