@@ -286,53 +286,6 @@ struct ac_xclipse_chip {
    struct ac_xclipse_pbb pbb;
 };
 
-/* Samsung Xclipse variants: same pci_id 0x73A0, sgpu kernel, ioctl ABI and shader core design;
- * they differ in scale and kernel family id. Resolved from ro.soc.model, checked against chip_rev. */
-enum ac_xclipse_model {
-   AC_XCLIPSE_NONE = 0,  /* not an Xclipse at all */
-   AC_XCLIPSE_920,       /* s5e9925/s5e9935, MGFX0, kernel family VGH(144), 6 CU, 4 L2 */
-   AC_XCLIPSE_530,       /* s5e8845, MGFX1_MID, kernel family MGFX(147), 2 CU, 1 L2 */
-   AC_XCLIPSE_940,       /* MAGELLAN CARL: s5e9945, MGFX2, kernel family MGFX(147), 12 CU;
-                          * the 530's register map */
-   AC_XCLIPSE_540,       /* ARIEL: s5e8855, MGFX2_MID, kernel family MGFX(147), 4 CU; the 940's
-                          * register map (the kernel builds it with gc_10_4_0_offset_m2.h) */
-   AC_XCLIPSE_950,       /* GALILEO: s5e9955, MGFX3, kernel family MGFX(147), 2 SE x 2 SA, 16 CU; the 940's
-                          * register offsets (gc_10_4_0_offset_m3.h), GE_CNTL in the GFX11 layout */
-   AC_XCLIPSE_960,       /* JUNO: s5e9965, MGFX4, kernel family MGFX(147), 2 SE x 2 SA, 16 CU; the 950's
-                          * register map (gc_10_4_0_offset_m4.h moves only privileged CAC/EDC
-                          * power registers and adds syndrome / hang-detect registers) */
-   AC_XCLIPSE_550,       /* TRITON: s5e8865, MGFX3_MID, kernel family MGFX(147), 1 SE x 1 SA, 4 CU;
-                          * the 950's register map (the kernel builds it with gc_10_4_0_offset_m3.h) */
-   AC_XCLIPSE_UNKNOWN,   /* a 0x73A0 whose SoC we do not recognise -- treat conservatively */
-   AC_XCLIPSE_MODEL_COUNT,
-};
-
-/* Everything that differs between Xclipse chips, one row per chip (ac_xclipse_chips[] in
- * ac_gpu_info.c, indexed by enum ac_xclipse_model). Code asks for its own chip's row instead of
- * comparing models, so a setting made for one chip cannot reach another. */
-/* The binner as the vendor programs it on one chip, read from its command stream with vspy. */
-struct ac_xclipse_pbb {
-   unsigned bin_size;          /* fixed square bin edge in pixels; 0 = computed from the targets
-                                * like upstream, without upstream's 128x128 floor */
-   unsigned context_states;    /* PA_SC_BINNER_CNTL_0.CONTEXT_STATES_PER_BIN + 1 */
-   unsigned persistent_states; /* PA_SC_BINNER_CNTL_0.PERSISTENT_STATES_PER_BIN + 1 */
-   uint32_t cntl_1;            /* PA_SC_BINNER_CNTL_1: allocation budget, prims per batch */
-   uint32_t cntl_2;            /* PA_SC_BINNER_CNTL_2: sub-batch binning, ping-pong bin order */
-   bool on;                    /* use it unless RADV_XCLIPSE_PBB says otherwise; a row whose
-                                * cntl_1 is 0 has no vendor values */
-};
-
-struct ac_xclipse_chip {
-   const char *name;        /* "920", "530", ... (logs) */
-   const char *codename;    /* device and renderer string; NULL = the family name */
-   bool titan_regmap;       /* runs as CHIP_TITAN: the 530's register map */
-   bool has_rt;             /* ray tracing hardware (BVH instructions, RT extensions) */
-   bool ctx_init;           /* initialise every context register at queue start */
-   bool no_cp_dma_prefetch; /* never prefetch shaders or vertex descriptors with CP DMA */
-   bool submit_pacing;      /* hold back uncapped GFX work so the Android UI stays responsive */
-   bool unstable;           /* refused (apps get the vendor driver) unless MESA_XCLIPSE_UNSTABLE=1 */
-   struct ac_xclipse_pbb pbb;
-};
 
 struct radeon_info {
    /* Device info. */
