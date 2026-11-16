@@ -421,6 +421,9 @@ typedef struct {
 
    /* Exports. */
    bool uses_discard;
+   /* Xclipse 920: packed exports use GFX11 conventions (per-VGPR enable mask,
+    * no COMPR); a COMPR export is dropped. */
+   bool gfx11_export_conventions;
    bool dcc_decompress_gfx11;
    bool alpha_to_coverage_via_mrtz;
    bool dual_src_blend;
